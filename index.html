@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="AI-powered smart money trading analyzer for FundingPips — real-time order blocks, supply/demand zones, and confluence-based trade signals.">
+  <title>Trade Analyzer — Smart Money System</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/styles/main.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Header -->
+    <header id="app-header" class="glass-panel">
+      <div class="header-left">
+        <div class="logo">
+          <span class="logo-icon">◈</span>
+          <span class="logo-text">Trade<span class="logo-accent">Analyzer</span></span>
+        </div>
+        <div id="symbol-selector" class="symbol-selector"></div>
+      </div>
+      <div class="header-center">
+        <div id="timeframe-selector" class="timeframe-selector"></div>
+      </div>
+      <div class="header-right">
+        <div id="live-price-display" class="live-price-display">
+          <div class="price-main">
+            <span id="current-price" class="current-price">--</span>
+            <span id="price-change" class="price-change">--</span>
+          </div>
+        </div>
+        <div id="account-summary" class="account-summary">
+          <div class="account-metric">
+            <span class="account-label">Balance</span>
+            <span id="account-balance" class="account-value">$5,000.00</span>
+          </div>
+          <div class="account-metric">
+            <span class="account-label">Equity</span>
+            <span id="account-equity" class="account-value">$5,000.00</span>
+          </div>
+        </div>
+        <button id="btn-reset-account" class="btn btn-sm btn-outline btn-reset-account" title="Reset Account State">
+          🔄 Reset
+        </button>
+        <div id="daily-loss-counter" class="daily-loss-counter">
+          <span class="loss-label">Losses</span>
+          <span id="loss-count" class="loss-count">0</span>
+        </div>
+        <div id="connection-status" class="connection-status">
+          <span class="status-dot disconnected"></span>
+          <span class="status-text">Connecting...</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main id="main-content" class="main-content">
+      <!-- Chart Area -->
+      <div id="chart-area" class="chart-area glass-panel">
+        <div id="chart-container" class="chart-container"></div>
+        <div id="chart-overlay-info" class="chart-overlay-info">
+          <span id="overlay-symbol" class="overlay-symbol"></span>
+          <span id="overlay-timeframe" class="overlay-timeframe"></span>
+        </div>
+      </div>
+
+      <!-- Right Sidebar -->
+      <aside id="right-sidebar" class="right-sidebar">
+
+        <!-- Trade Manager -->
+        <div id="trade-panel" class="trade-panel glass-panel">
+          <div class="panel-header">
+            <h2 class="panel-title">
+              <span class="panel-icon">📊</span> Active Trades
+            </h2>
+          </div>
+          <div id="trade-list" class="trade-list">
+            <div class="empty-state">
+              <span class="empty-icon">🎯</span>
+              <p>No active trades</p>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- Bottom Analysis Panel -->
+    <div id="analysis-section" class="analysis-section glass-panel">
+      <div class="analysis-tabs">
+        <button class="tab-btn active" data-tab="overview">Overview</button>
+        <button class="tab-btn" data-tab="structure">Structure</button>
+        <button class="tab-btn" data-tab="orderblocks">Order Blocks</button>
+        <button class="tab-btn" data-tab="zones">S/D Zones</button>
+        <button class="tab-btn" data-tab="indicators">Indicators</button>
+        <button class="tab-btn" data-tab="calculator">Lot Calculator</button>
+        <button class="tab-btn" data-tab="dashboard">Dashboard</button>
+        <button class="tab-btn" data-tab="overall">Overall Dashboard</button>
+        <button class="tab-btn" data-tab="chat">AI Analyst</button>
+      </div>
+      <div id="analysis-content" class="analysis-content">
+        <div id="tab-overview" class="tab-pane active"></div>
+        <div id="tab-structure" class="tab-pane"></div>
+        <div id="tab-orderblocks" class="tab-pane"></div>
+        <div id="tab-zones" class="tab-pane"></div>
+        <div id="tab-indicators" class="tab-pane"></div>
+        <div id="tab-calculator" class="tab-pane"></div>
+        <div id="tab-dashboard" class="tab-pane"></div>
+        <div id="tab-overall" class="tab-pane"></div>
+        <div id="tab-chat" class="tab-pane"></div>
+      </div>
+    </div>
+
+    <!-- Daily Stop Warning Overlay -->
+    <div id="daily-stop-overlay" class="daily-stop-overlay hidden">
+      <div class="daily-stop-modal glass-panel">
+        <span class="stop-icon">🛑</span>
+        <h2>Trading Stopped</h2>
+        <p>You've hit 3 losses today. Take a break and come back tomorrow.</p>
+        <button id="acknowledge-stop" class="btn btn-outline">I Understand</button>
+      </div>
+    </div>
+
+    <!-- Disclaimer -->
+    <div id="disclaimer" class="disclaimer">
+      ⚠️ Not financial advice. Algorithmic analysis for educational purposes only. Trade at your own risk.
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
