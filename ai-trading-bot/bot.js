@@ -1,26 +1,44 @@
 import { Bot } from 'grammy';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
 
 dotenv.config();
 
 // ─── Config ───────────────────────────────────────────
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const GEMINI_KEY = process.env.GEMINI_API_KEY;
-const TRADE_URL  = process.env.TRADE_ANALYZER_URL || 'https://trade-analyzer-4rpq.onrender.com';
+const BOT_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const TRADE_URL   = process.env.TRADE_ANALYZER_URL || 'https://trade-analyzer-4rpq.onrender.com';
+const AI_MODEL    = process.env.AI_MODEL || 'gpt-4o-mini';
+const AI_BASE     = 'https://models.inference.ai.azure.com';
 
-if (!BOT_TOKEN) { console.error('TELEGRAM_BOT_TOKEN missing'); process.exit(1); }
-if (!GEMINI_KEY) { console.error('GEMINI_API_KEY missing — get one free at https://aistudio.google.com/apikey'); process.exit(1); }
+if (!BOT_TOKEN)    { console.error('TELEGRAM_BOT_TOKEN missing'); process.exit(1); }
+if (!GITHUB_TOKEN) { console.error('GITHUB_TOKEN missing — use your GitHub Personal Access Token'); process.exit(1); }
 
-// ─── Gemini AI ────────────────────────────────────────
-const genAI  = new GoogleGenerativeAI(GEMINI_KEY);
-const model  = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+// ─── GitHub Models AI (Free GPT-4o-mini) ─────────────
+async function askAI(messages) {
+  const res = await fetch(`${AI_BASE}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${GITHUB_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: AI_MODEL,
+      messages: messages,
+      temperature: 0.8,
+      max_tokens: 2048,
+    }),
+    signal: AbortSignal.timeout(30000),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  return data.choices[0].message.content;
+}
 
 // ─── Trade Analyzer API Helper ───────────────────────
 async function fetchTradeData() {
   try {
-    const res  = await fetch(`${TRADE_URL}/api/terminal-state`, { signal: AbortSignal.timeout(8000) });
+    const res = await fetch(`${TRADE_URL}/api/terminal-state`, { signal: AbortSignal.timeout(8000) });
     return await res.json();
   } catch (e) {
     return { error: 'Gagal mengambil data trade analyzer' };
@@ -39,41 +57,38 @@ async function fetchMarketData(symbol) {
 // ─── Format trade data for AI context ────────────────
 function formatTradeContext(data) {
   if (data.error) return `Trade Analyzer API error: ${data.error}`;
-  
-  let text = `📊 TRADING TERMINAL STATUS\n`;
-  text += `━━━━━━━━━━━━━━━━━━━━\n`;
-  text += `💰 Balance: $${(data.accountBalance || 0).toLocaleString()}\n`;
-  text += `📊 Equity: $${(data.accountBalance || 0).toLocaleString()}\n`;
-  text += `🔴 Daily Losses: ${data.dailyLosses || 0}/3\n`;
+
+  let text = `TRADING TERMINAL STATUS\n`;
+  text += `Balance: $${(data.accountBalance || 0).toLocaleString()}\n`;
+  text += `Daily Losses: ${data.dailyLosses || 0}/3\n`;
   text += `\n`;
 
-  // Active trades
   if (data.activeTrades && data.activeTrades.length > 0) {
-    text += `📈 ACTIVE TRADES (${data.activeTrades.length}):\n`;
+    text += `ACTIVE TRADES (${data.activeTrades.length}):\n`;
     for (const t of data.activeTrades) {
       const pnl = ((t.currentPrice || t.entry) - t.entry) * (t.direction === 'long' ? 1 : -1);
       const pnlPct = ((pnl / t.entry) * 100).toFixed(2);
-      const emoji = pnl >= 0 ? '🟢' : '🔴';
-      text += `  ${emoji} ${t.symbol} | ${t.direction.toUpperCase()} | Entry: $${t.entry} | P/L: $${pnl.toFixed(2)} (${pnlPct}%)\n`;
-      text += `     SL: $${t.stopLoss} | TP: $${t.takeProfit} | Quality: ${t.quality || '-'}\n`;
+      const status = pnl >= 0 ? 'PROFIT' : 'LOSS';
+      text += `  - ${t.symbol} | ${t.direction.toUpperCase()} | Entry: $${t.entry} | P/L: $${pnl.toFixed(2)} (${pnlPct}%) ${status}\n`;
+      text += `    SL: $${t.stopLoss} | TP: $${t.takeProfit} | Quality: ${t.quality || '-'}\n`;
     }
   } else {
-    text += `📭 Tidak ada trade aktif\n`;
+    text += `Tidak ada trade aktif saat ini.\n`;
   }
 
-  text += `\n📋 TRADE HISTORY (${(data.tradeHistory || []).length} trades):\n`;
+  text += `\nTRADE HISTORY (${(data.tradeHistory || []).length} trades):\n`;
   const recent = (data.tradeHistory || []).slice(-5).reverse();
   for (const t of recent) {
-    const emoji = (t.pnl || 0) >= 0 ? '✅' : '❌';
-    text += `  ${emoji} ${t.symbol} | ${t.direction || '?'} | P/L: $${(t.pnl || 0).toFixed(2)}\n`;
+    const pnl = t.pnl || 0;
+    const status = pnl >= 0 ? 'WIN' : 'LOSS';
+    text += `  - ${t.symbol} | ${t.direction || '?'} | P/L: $${pnl.toFixed(2)} | ${status}\n`;
   }
 
-  // Feed status
   if (data.feeds) {
-    text += `\n📡 Data Feeds:\n`;
+    text += `\nDATA FEEDS STATUS:\n`;
     for (const [sym, age] of Object.entries(data.feeds)) {
-      const status = age === null ? '🔴 OFFLINE' : (age < 60 ? '🟢' : (age < 300 ? '🟡' : '🔴'));
-      text += `  ${status} ${sym}: ${age !== null ? age + 's ago' : 'N/A'}\n`;
+      const s = age === null ? 'OFFLINE' : (age < 60 ? 'LIVE' : (age < 300 ? 'SLOW' : 'STALE'));
+      text += `  - ${sym}: ${s} (${age !== null ? age + 's ago' : 'N/A'})\n`;
     }
   }
 
@@ -109,7 +124,7 @@ GAYA BAHASA:
 - Jelaskan dengan jelas dan terstruktur
 - Selalu ingatkan bahwa ini bukan financial advice
 
-Ketika user bertanya tentang status trading, kamu akan diberikan data real-time dari Trade Analyzer terminal.`;
+Ketika user bertanya tentang status trading, data real-time akan diberikan sebelum pesan user.`;
 
 // ─── Conversation Memory (per user, last 10 messages) ──
 const conversations = new Map();
@@ -123,7 +138,6 @@ function getUserMemory(userId) {
 
 // ─── Command Handlers ─────────────────────────────────
 
-// /start
 bot.command('start', async (ctx) => {
   await ctx.reply(
     `🦞 *CAK Trading Assistant*\n\n` +
@@ -139,23 +153,17 @@ bot.command('start', async (ctx) => {
   );
 });
 
-// /status
 bot.command('status', async (ctx) => {
   await ctx.reply('📊 Mengambil data terminal...');
-  const data = fetchTradeData();
-  // Show loading, then edit with data
-  setTimeout(async () => {
-    const d = await data;
-    const text = formatTradeContext(d);
-    await ctx.reply(text);
-  }, 2000);
+  const d = await fetchTradeData();
+  const text = formatTradeContext(d);
+  await ctx.reply(text);
 });
 
-// /market
 bot.command('market', async (ctx) => {
   const symbols = ['BTCUSDT', 'XAUUSD', 'GBPUSD', 'USDCAD'];
   let text = '📈 *HARGA PASAR TERKINI*\n━━━━━━━━━━━━━━━━━━━━\n';
-  
+
   for (const sym of symbols) {
     const d = await fetchMarketData(sym);
     if (d.price) {
@@ -166,13 +174,9 @@ bot.command('market', async (ctx) => {
   await ctx.reply(text, { parse_mode: 'Markdown' });
 });
 
-// /balance
 bot.command('balance', async (ctx) => {
   const d = await fetchTradeData();
-  if (d.error) {
-    await ctx.reply(`❌ ${d.error}`);
-    return;
-  }
+  if (d.error) { await ctx.reply(`❌ ${d.error}`); return; }
   await ctx.reply(
     `💰 *ACCOUNT BALANCE*\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -184,24 +188,17 @@ bot.command('balance', async (ctx) => {
   );
 });
 
-// /history
 bot.command('history', async (ctx) => {
   const d = await fetchTradeData();
-  if (d.error) {
-    await ctx.reply(`❌ ${d.error}`);
-    return;
-  }
+  if (d.error) { await ctx.reply(`❌ ${d.error}`); return; }
   const history = d.tradeHistory || [];
-  if (history.length === 0) {
-    await ctx.reply('📭 Belum ada riwayat trade.');
-    return;
-  }
-  
+  if (history.length === 0) { await ctx.reply('📭 Belum ada riwayat trade.'); return; }
+
   let text = `📋 *RIWAYAT TRADE* (${history.length} total)\n━━━━━━━━━━━━━━━━━━━━\n`;
   const last10 = history.slice(-10).reverse();
   let totalPnl = 0;
   let wins = 0, losses = 0;
-  
+
   for (const t of last10) {
     const pnl = t.pnl || 0;
     totalPnl += pnl;
@@ -209,13 +206,12 @@ bot.command('history', async (ctx) => {
     const emoji = pnl >= 0 ? '🟢' : '🔴';
     text += `${emoji} ${t.symbol} | ${t.direction?.toUpperCase() || '?'} | $${pnl.toFixed(2)} | ${t.quality || '-'}\n`;
   }
-  
+
   const winRate = last10.length > 0 ? ((wins / last10.length) * 100).toFixed(0) : 0;
   text += `\n📊 Win Rate: ${winRate}% | Total P/L: $${totalPnl.toFixed(2)}`;
   await ctx.reply(text, { parse_mode: 'Markdown' });
 });
 
-// /help
 bot.command('help', async (ctx) => {
   await ctx.reply(
     `🦞 *CAK Trading Assistant — Help*\n\n` +
@@ -235,62 +231,53 @@ bot.command('help', async (ctx) => {
 bot.on('message:text', async (ctx) => {
   const userMsg = ctx.message.text;
   const userId = ctx.from.id;
-  
-  // Show typing indicator
+
   await ctx.replyWithChatAction('typing');
-  
-  // Get user conversation memory
+
   const memory = getUserMemory(userId);
-  memory.push({ role: 'user', text: userMsg });
-  
-  // Check if message is trading-related to inject real-time data
-  const tradingKeywords = ['trade', 'posisi', 'signal', 'sinyal', 'profit', 'loss', 'rugi', 'untung', 
+  memory.push({ role: 'user', content: userMsg });
+
+  // Detect trading-related queries
+  const tradingKeywords = ['trade', 'posisi', 'signal', 'sinyal', 'profit', 'loss', 'rugi', 'untung',
     'balance', 'saldo', 'pnl', 'harga', 'price', 'btc', 'xau', 'gbp', 'usd', 'forex', 'crypto',
     'status', 'terminal', 'analisa', 'order block', 'supply', 'demand', 'market', 'sell', 'buy',
-    'trading', 'trade aktif', 'buka', 'tutup', 'stop loss', 'take profit'];
-  
+    'trading', 'trade aktif', 'buka', 'tutup', 'stop loss', 'take profit', 'emas', 'gold', 'dollar'];
+
   const isTradeRelated = tradingKeywords.some(kw => userMsg.toLowerCase().includes(kw));
-  
-  let tradeContext = '';
+
+  // Build messages array for OpenAI-compatible API
+  const messages = [{ role: 'system', content: SYSTEM_PROMPT }];
+
+  // Add conversation history
+  for (const m of memory.slice(0, -1)) {
+    messages.push({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content || m.text });
+  }
+
+  // Inject trade data if trading-related
   if (isTradeRelated) {
     try {
       const tradeData = await fetchTradeData();
-      tradeContext = '\n\n[DATA REAL-TIME DARI TRADE ANALYZER TERMINAL]\n' + formatTradeContext(tradeData) + '\n';
+      const tradeContext = formatTradeContext(tradeData);
+      messages.push({
+        role: 'system',
+        content: `DATA REAL-TIME DARI TRADE ANALYZER TERMINAL USER:\n${tradeContext}\n\nBerdasarkan data di atas, jawab pertanyaan user. Berikan analisa yang jelas dan bermanfaat.`
+      });
     } catch (e) {
-      tradeContext = '\n[Trade Analyzer API sedang tidak bisa diakses]\n';
+      messages.push({ role: 'system', content: 'Trade Analyzer API sedang tidak bisa diakses. Jawab berdasarkan pengetahuan umum.' });
     }
   }
-  
+
+  // Add current message
+  messages.push({ role: 'user', content: userMsg });
+
   try {
-    // Build prompt with history
-    const chatHistory = memory.map(m => ({
-      role: m.role === 'user' ? 'user' : 'model',
-      parts: [{ text: m.text }]
-    }));
-    
-    const prompt = tradeContext 
-      ? `${SYSTEM_PROMPT}\n\nUser sedang bertanya terkait trading. Berikut data real-time dari terminal trading user:${tradeContext}\n\nPesan user: ${userMsg}`
-      : `${SYSTEM_PROMPT}\n\nPesan user: ${userMsg}`;
-    
-    const result = await model.generateContent({
-      contents: chatHistory.length > 0 ? [...chatHistory, { role: 'user', parts: [{ text: prompt }] }] : [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.8,
-        maxOutputTokens: 2048,
-      }
-    });
-    
-    const reply = result.response.text();
-    
-    // Save to memory
-    memory.push({ role: 'assistant', text: reply });
-    
-    // Send reply
+    const reply = await askAI(messages);
+    memory.push({ role: 'assistant', content: reply });
+
     await ctx.reply(reply, { parse_mode: 'Markdown' }).catch(() => {
-      // Fallback without markdown if formatting fails
       ctx.reply(reply);
     });
-    
+
   } catch (e) {
     console.error('AI Error:', e.message);
     await ctx.reply('❌ Maaf, ada error. Coba lagi ya!');
@@ -299,10 +286,11 @@ bot.on('message:text', async (ctx) => {
 
 // ─── Start Bot ────────────────────────────────────────
 console.log('🦞 CAK Trading Assistant starting...');
+console.log(`🤖 AI Model: ${AI_MODEL} (GitHub Models - FREE)`);
+console.log(`📡 Trade Analyzer: ${TRADE_URL}`);
 bot.start({
   onStart: (info) => {
     console.log(`✅ Bot started as @${info.username}`);
-    console.log(`📡 Trade Analyzer: ${TRADE_URL}`);
   }
 }).catch(e => {
   console.error('❌ Bot failed to start:', e.message);
