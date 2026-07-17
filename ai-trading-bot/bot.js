@@ -1,6 +1,7 @@
 import { Bot } from 'grammy';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
+import http from 'http';
 
 dotenv.config();
 
@@ -284,10 +285,28 @@ bot.on('message:text', async (ctx) => {
   }
 });
 
-// ─── Start Bot ────────────────────────────────────────
+// ─── Health Check Server (Render needs this) ─────────
+const PORT = process.env.PORT || 10000;
+const server = http.createServer((req, res) => {
+  if (req.url === '/health' || req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', bot: 'CAK Trading Assistant', model: AI_MODEL }));
+  } else {
+    res.writeHead(404);
+    res.end('Not Found');
+  }
+});
+
+// ─── Start Bot + Server ──────────────────────────────
 console.log('🦞 CAK Trading Assistant starting...');
 console.log(`🤖 AI Model: ${AI_MODEL} (GitHub Models - FREE)`);
 console.log(`📡 Trade Analyzer: ${TRADE_URL}`);
+console.log(`🌐 Health check on port ${PORT}`);
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Health server listening on port ${PORT}`);
+});
+
 bot.start({
   onStart: (info) => {
     console.log(`✅ Bot started as @${info.username}`);
