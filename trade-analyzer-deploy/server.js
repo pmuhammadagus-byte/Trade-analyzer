@@ -519,23 +519,22 @@ app.use((req, res) => {
 //  Scheduled Telegram Report (every 15 minutes)
 // --------------------------------------------------------------------
 const TREND_EMOJI = {
-  strong_bullish: '🟢🟢', bullish: '🟢', ranging: '🟡', bearish: '🔴', strong_bearish: '🔴🔴',
+  strong_bullish: '\U0001f7e2\U0001f7e2', bullish: '\U0001f7e2', ranging: '\U0001f7e1', bearish: '\U0001f534', strong_bearish: '\U0001f534\U0001f534',
 };
 
 function sendScheduledReport() {
   const now = new Date();
   const timeStr = now.toLocaleString('en-GB', { timeZone: 'Asia/Jakarta', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 
-  let msg = `📊 <b>TRADE ANALYZOR — MARKET REPORT</b>\n`;
-  msg += `🕐 <code>${timeStr} WIB</code>\n`;
-  msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+  let msg = `\u{1F4CA} <b>TRADE ANALYZOR \u2014 MARKET REPORT</b>\n`;
+  msg += `\u{1F550} <code>${timeStr} WIB</code>\n`;
+  msg += `\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n`;
 
-  // --- Per-symbol analysis ---
   for (const symbol of SYMBOLS) {
     const candles = historyMap[symbol];
     const price = livePrices[symbol];
     if (!candles || candles.length < 50 || !price) {
-      msg += `🔸 <b>${symbol}</b>\n⏳ Data belum tersedia\n\n`;
+      msg += `\u{1F538} <b>${symbol}</b>\n\u23F3 Data belum tersedia\n\n`;
       continue;
     }
 
@@ -555,72 +554,64 @@ function sendScheduledReport() {
     const lastATR = atrVals[atrVals.length - 1];
     const lastBBUpper = bb.upper[bb.upper.length - 1];
     const lastBBLower = bb.lower[bb.lower.length - 1];
-    const lastBBMiddle = bb.middle[bb.middle.length - 1];
     const lastEma21 = ema21Vals[ema21Vals.length - 1];
     const lastEma50 = ema50Vals[ema50Vals.length - 1];
 
-    // RSI label
     let rsiLabel = 'NETRAL';
-    if (lastRSI > 70) rsiLabel = '🟢 OVERBOUGHT';
-    else if (lastRSI < 30) rsiLabel = '🔴 OVERSOLD';
-    else if (lastRSI > 55) rsiLabel = '🟢 Bullish';
-    else if (lastRSI < 45) rsiLabel = '🔴 Bearish';
+    if (lastRSI > 70) rsiLabel = '\u{1F7E2} OVERBOUGHT';
+    else if (lastRSI < 30) rsiLabel = '\u{1F534} OVERSOLD';
+    else if (lastRSI > 55) rsiLabel = '\u{1F7E2} Bullish';
+    else if (lastRSI < 45) rsiLabel = '\u{1F534} Bearish';
 
-    // MACD label
-    let macdLabel = '—';
+    let macdLabel = '-';
     if (!isNaN(lastHist)) {
-      if (lastHist > 0 && lastMACD > lastSignal) macdLabel = '🟢 Bullish';
-      else if (lastHist < 0 && lastMACD < lastSignal) macdLabel = '🔴 Bearish';
+      if (lastHist > 0 && lastMACD > lastSignal) macdLabel = '\u{1F7E2} Bullish';
+      else if (lastHist < 0 && lastMACD < lastSignal) macdLabel = '\u{1F534} Bearish';
     }
 
-    // BB position
-    let bbPos = '—';
+    let bbPos = '-';
     if (!isNaN(lastBBUpper) && !isNaN(lastBBLower)) {
       const bbRange = lastBBUpper - lastBBLower;
       if (bbRange > 0) {
         const pct = ((price - lastBBLower) / bbRange * 100).toFixed(0);
-        bbPos = `${pct}% band`;
-        if (price >= lastBBUpper) bbPos = '🔥 Upper band';
-        else if (price <= lastBBLower) bbPos = '❄️ Lower band';
+        bbPos = pct + '% band';
+        if (price >= lastBBUpper) bbPos = '\u{1F525} Upper band';
+        else if (price <= lastBBLower) bbPos = '\u2744\uFE0F Lower band';
       }
     }
 
-    // Price formatting
-    const fmtPrice = symbol === 'BTCUSDT' ? price.toFixed(0) : symbol === 'XAUUSD' ? price.toFixed(2) : price.toFixed(5);
+    const dp = symbol === 'BTCUSDT' ? 0 : symbol === 'XAUUSD' ? 2 : 5;
+    const trendEmoji = TREND_EMOJI[trend.direction] || '\u{1F7E1}';
+    const trendLabel = trend.direction.replace('_', ' ').toUpperCase();
 
-    msg += `🔸 <b>${symbol}</b>  <code>$${fmtPrice}</code>\n`;
-    msg += `   Trend: ${TREND_EMOJI[trend.direction] || '🟡'} <b>${trend.direction.replace('_', ' ').toUpperCase()}</b> (${trend.strength}/100)\n`;
-    msg += `   RSI(14): <code>${isNaN(lastRSI) ? '—' : lastRSI.toFixed(1)}</code> ${rsiLabel}\n`;
+    msg += `\u{1F538} <b>${symbol}</b>  <code>$${price.toFixed(dp)}</code>\n`;
+    msg += `   Trend: ${trendEmoji} <b>${trendLabel}</b> (${trend.strength}/100)\n`;
+    msg += `   RSI(14): <code>${isNaN(lastRSI) ? '-' : lastRSI.toFixed(1)}</code> ${rsiLabel}\n`;
     msg += `   MACD: ${macdLabel}\n`;
-    if (!isNaN(lastEma21)) msg += `   EMA21: <code>${lastEma21.toFixed(symbol === 'BTCUSDT' ? 0 : symbol === 'XAUUSD' ? 2 : 5)}</code>  EMA50: <code>${lastEma50.toFixed(symbol === 'BTCUSDT' ? 0 : symbol === 'XAUUSD' ? 2 : 5)}</code>\n`;
-    if (bbPos !== '—') msg += `   BB: ${bbPos}\n`;
-    if (!isNaN(lastATR)) msg += `   ATR(14): <code>${lastATR.toFixed(symbol === 'BTCUSDT' ? 0 : symbol === 'XAUUSD' ? 2 : 5)}</code>\n`;
+    if (!isNaN(lastEma21)) msg += `   EMA21: <code>${lastEma21.toFixed(dp)}</code>  EMA50: <code>${lastEma50.toFixed(dp)}</code>\n`;
+    if (bbPos !== '-') msg += `   BB: ${bbPos}\n`;
+    if (!isNaN(lastATR)) msg += `   ATR(14): <code>${lastATR.toFixed(dp)}</code>\n`;
 
-    // Check for active trades on this symbol
     const activeTrade = tradeManager.activeTrades.find(t => t.symbol === symbol && t.status === 'active');
     if (activeTrade) {
       const pnl = activeTrade.currentPnL || 0;
-      const pnlEmoji = pnl >= 0 ? '💰' : '📉';
-      msg += `   ${pnlEmoji} <b>ACTIVE ${activeTrade.type}</b> | P&L: <code>${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</code>\n`;
+      const pnlE = pnl >= 0 ? '\u{1F4B0}' : '\u{1F4C9}';
+      msg += `   ${pnlE} <b>ACTIVE ${activeTrade.type}</b> | P&L: <code>${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</code>\n`;
     }
-
     msg += `\n`;
   }
 
-  // --- Account Summary ---
   const todayWins = tradeManager.tradeHistory.filter(t => {
-    const d = new Date(t.closedAt).toDateString();
-    return d === now.toDateString() && t.profit > 0;
+    return new Date(t.closedAt).toDateString() === now.toDateString() && t.profit > 0;
   }).length;
   const todayLosses = tradeManager.tradeHistory.filter(t => {
-    const d = new Date(t.closedAt).toDateString();
-    return d === now.toDateString() && t.profit <= 0;
+    return new Date(t.closedAt).toDateString() === now.toDateString() && t.profit <= 0;
   }).length;
 
-  msg += `━━━━━━━━━━━━━━━━━━━━\n`;
-  msg += `🏦 <b>ACCOUNT</b>\n`;
+  msg += `\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n`;
+  msg += `\u{1F3E6} <b>ACCOUNT</b>\n`;
   msg += `   Balance: <code>$${tradeManager.accountBalance.toFixed(2)}</code>\n`;
-  msg += `   Active: <code>${tradeManager.activeTrades.length}</code> | Today: <code>✅${todayWins} ❌${todayLosses}</code>\n`;
+  msg += `   Active: <code>${tradeManager.activeTrades.length}</code> | Today: <code>\u2705${todayWins} \u274C${todayLosses}</code>\n`;
 
   sendTelegramMessage(msg);
   console.log(`[Telegram Report] Scheduled report sent at ${timeStr}`);
@@ -657,7 +648,6 @@ async function bootServer() {
     await startAutopilot();
 
     // 3. Start scheduled Telegram reports every 15 minutes
-    // First report after 60s (wait for data to load), then every 15 min
     setTimeout(() => {
       sendScheduledReport();
       setInterval(sendScheduledReport, 15 * 60 * 1000);
