@@ -1,0 +1,14 @@
+{
+  "name": "ai-trading-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.0",
+    "grammy": "^1.35.0",
+    "dotenv": "^17.4.2",
+    "node-fetch": "^3.3.2"
+  }
+}
