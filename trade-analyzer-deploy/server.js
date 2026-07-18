@@ -465,6 +465,56 @@ app.post('/api/telegram-webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
+    // --- Public commands (bisa dipakai semua user) ---
+
+    // /myid — cek ID sendiri
+    if (text === '/myid') {
+      await sendTG(chatId, `ID Anda: <code>${senderId}</code>\nUsername: @${senderUsername || '-'}\nNama: ${senderName}`);
+      return res.sendStatus(200);
+    }
+
+    // /subs — cek status langganan (user biasa) / list semua pelanggan (admin)
+    if (text === '/subs') {
+      if (ADMIN_ID && senderId === ADMIN_ID) {
+        // Admin: tampilkan semua pelanggan aktif
+        const subs = await listSubscribers();
+        if (subs.length === 0) { await sendTG(chatId, 'Belum ada pelanggan aktif.'); return res.sendStatus(200); }
+        let list = `\u{1F4CB} <b>Pelanggan Aktif (${subs.length})</b>\n\n`;
+        for (const s of subs) {
+          const exp = s.expiresAt ? ` | exp: ${s.expiresAt.toLocaleDateString('id-ID')}` : ' | lifetime';
+          list += `<code>${s.telegramUserId}</code> @${s.username || '-'} ${s.firstName}${exp}\n`;
+        }
+        await sendTG(chatId, list);
+      } else {
+        // User biasa: tampilkan status langganan sendiri
+        const sub = await Subscriber.findOne({ telegramUserId: senderId, active: true });
+        if (!sub || (sub.expiresAt && sub.expiresAt < new Date())) {
+          await sendTG(chatId,
+            '\u{1F514} <b>Status Langganan</b>\n\n' +
+            'Anda <b>belum berlangganan</b>.\n\n' +
+            'Hubungi admin untuk mendaftar.'
+          );
+        } else {
+          const expText = sub.expiresAt
+            ? `${sub.expiresAt.toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })}`
+            : 'Lifetime';
+          const sisaHari = sub.expiresAt
+            ? Math.ceil((sub.expiresAt - new Date()) / 86400000)
+            : null;
+          await sendTG(chatId,
+            `\u2705 <b>Status Langganan</b>\n\n` +
+            `Nama: ${sub.firstName || senderName}\n` +
+            `Status: <b>Aktif</b>\n` +
+            `Berlangganan sejak: ${sub.subscribedAt.toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })}\n` +
+            `Masa berlaku: ${expText}` +
+            (sisaHari !== null ? ` (${sisaHari} hari lagi)` : '') + '\n\n' +
+            'Gunakan /dashboard untuk membuka trade analyzer.'
+          );
+        }
+      }
+      return res.sendStatus(200);
+    }
+
     // --- Admin commands (only ADMIN_ID) ---
     if (ADMIN_ID && senderId !== ADMIN_ID) {
       res.sendStatus(200);
@@ -488,25 +538,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
       if (!targetId) { await sendTG(chatId, 'Format: /removeuser <telegram_id>'); return res.sendStatus(200); }
       await removeSubscriber(targetId);
       await sendTG(chatId, `\u274C Pelanggan <code>${targetId}</code> dihapus.`);
-      return res.sendStatus(200);
-    }
-
-    // /subs — list semua pelanggan aktif
-    if (text === '/subs') {
-      const subs = await listSubscribers();
-      if (subs.length === 0) { await sendTG(chatId, 'Belum ada pelanggan aktif.'); return res.sendStatus(200); }
-      let list = `\u{1F4CB} <b>Pelanggan Aktif (${subs.length})</b>\n\n`;
-      for (const s of subs) {
-        const exp = s.expiresAt ? ` | exp: ${s.expiresAt.toLocaleDateString('id-ID')}` : ' | lifetime';
-        list += `<code>${s.telegramUserId}</code> @${s.username || '-'} ${s.firstName}${exp}\n`;
-      }
-      await sendTG(chatId, list);
-      return res.sendStatus(200);
-    }
-
-    // /myid — cek ID sendiri
-    if (text === '/myid') {
-      await sendTG(chatId, `ID Anda: <code>${senderId}</code>\nUsername: @${senderUsername || '-'}\nNama: ${senderName}`);
       return res.sendStatus(200);
     }
 
