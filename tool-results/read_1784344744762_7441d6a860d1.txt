@@ -1,0 +1,893 @@
+     1→     1→import express from 'express';
+     2→     2→import cors from 'cors';
+     3→     3→import dotenv from 'dotenv';
+     4→     4→import path from 'path';
+     5→     5→import { fileURLToPath } from 'url';
+     6→     6→import WebSocket from 'ws';
+     7→     7→import crypto from 'crypto';
+     8→     8→
+     9→     9→// Load environment variables
+    10→    10→dotenv.config();
+    11→    11→
+    12→    12→// Deriving paths in ES module
+    13→    13→const __filename = fileURLToPath(import.meta.url);
+    14→    14→const __dirname = path.dirname(__filename);
+    15→    15→
+    16→    16→// --------------------------------------------------------------------
+    17→    17→//  WS & Fetch Polyfill (CORS & Proxy handling)
+    18→    18→// --------------------------------------------------------------------
+    19→    19→globalThis.WebSocket = WebSocket;
+    20→    20→
+    21→    21→const originalFetch = globalThis.fetch;
+    22→    22→globalThis.fetch = async (input, init) => {
+    23→    23→  let url = typeof input === 'string' ? input : input.url;
+    24→    24→
+    25→    25→  if (url.startsWith('/api/binance')) {
+    26→    26→    url = 'https://api.binance.com' + url.replace(/^\/api\/binance/, '');
+    27→    27→  } else if (url.startsWith('/api/finnhub')) {
+    28→    28→    url = 'https://finnhub.io' + url.replace(/^\/api\/finnhub/, '');
+    29→    29→  } else if (url.startsWith('/api/swissquote')) {
+    30→    30→    url = 'https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD';
+    31→    31→  } else if (url.startsWith('/api/yahoo') || url.includes('query1.finance.yahoo.com')) {
+    32→    32→    if (url.startsWith('/api/yahoo')) {
+    33→    33→      url = 'https://query1.finance.yahoo.com' + url.replace(/^\/api\/yahoo/, '');
+    34→    34→    }
+    35→    35→    init = init || {};
+    36→    36→    init.headers = {
+    37→    37→      ...init.headers,
+    38→    38→      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    39→    39→      'Origin': 'https://finance.yahoo.com',
+    40→    40→      'Referer': 'https://finance.yahoo.com',
+    41→    41→    };
+    42→    42→  }
+    43→    43→
+    44→    44→  return originalFetch(url, init);
+    45→    45→};
+    46→    46→
+    47→    47→// --------------------------------------------------------------------
+    48→    48→//  Imports of application code
+    49→    49→// --------------------------------------------------------------------
+    50→    50→import DBManager from './src/data/db.js';
+    51→    51→import mongoose from 'mongoose';
+    52→    52→import TradeManager from './src/components/tradeManager.js';
+    53→    53→import { BinanceStream } from './src/data/binanceWebSocket.js';
+    54→    54→import { YahooStream } from './src/data/yahooWebSocket.js';
+    55→    55→import { fetchKlines } from './src/data/binanceAPI.js';
+    56→    56→import { fetchCandles, filterForexOutlierWicks } from './src/data/yahooFinanceAPI.js';
+    57→    57→import { fetchTwelveCandles } from './src/data/twelveDataAPI.js';
+    58→    58→import { generateSignals, LIVE_STRATEGY_OPTS } from './src/analysis/signalGenerator.js';
+    59→    59→import { analyzeExit } from './src/analysis/exitManager.js';
+    60→    60→import { analyzeTrend } from './src/analysis/trendDetector.js';
+    61→    61→import { rsi, ema, atr, macd, bollingerBands } from './src/analysis/indicators.js';
+    62→    62→import { sendTelegramMessage } from './src/data/telegramNotifier.js';
+    63→    63→
+    64→    64→// --------------------------------------------------------------------
+    65→    65→//  App Setup
+    66→    66→// --------------------------------------------------------------------
+    67→    67→const app = express();
+    68→    68→app.use(cors());
+    69→    69→app.use(express.json());
+    70→    70→
+    71→    71→const PORT = process.env.PORT || 7860;
+    72→    72→const TIMEFRAME = process.env.AUTOPILOT_TIMEFRAME || '15m';
+    73→    73→const SYMBOLS = ['BTCUSDT', 'XAUUSD', 'GBPUSD', 'USDCAD'];
+    74→    74→const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+    75→    75→const WEBAPP_URL = process.env.TELEGRAM_WEBAPP_URL || '';
+    76→    76→const ADMIN_ID = process.env.ADMIN_TELEGRAM_ID ? Number(process.env.ADMIN_TELEGRAM_ID) : null;
+    77→    77→
+    78→    78→// Active sessions for Web App auth (token -> { userId, username, expiresAt })
+    79→    79→const activeSessions = new Map();
+    80→    80→
+    81→    81→// --------------------------------------------------------------------
+    82→    82→//  Subscriber Management (MongoDB)
+    83→    83→// --------------------------------------------------------------------
+    84→    84→const subscriberSchema = new mongoose.Schema({
+    85→    85→  telegramUserId: { type: Number, required: true, unique: true },
+    86→    86→  username: { type: String, default: '' },
+    87→    87→  firstName: { type: String, default: '' },
+    88→    88→  active: { type: Boolean, default: true },
+    89→    89→  subscribedAt: { type: Date, default: Date.now },
+    90→    90→  expiresAt: { type: Date, default: null },
+    91→    91→  notes: { type: String, default: '' },
+    92→    92→});
+    93→    93→const Subscriber = mongoose.model('Subscriber', subscriberSchema);
+    94→    94→
+    95→    95→async function isSubscriber(telegramUserId) {
+    96→    96→ if (!telegramUserId) return false;
+    97→    97→ const sub = await Subscriber.findOne({ telegramUserId, active: true });
+    98→    98→ if (!sub) return false;
+    99→    99→ if (sub.expiresAt && sub.expiresAt < new Date()) {
+   100→   100→   sub.active = false;
+   101→   101→   await sub.save();
+   102→   102→   return false;
+   103→   103→ }
+   104→   104→ return true;
+   105→   105→}
+   106→   106→
+   107→   107→async function addSubscriber(telegramUserId, username, firstName, daysValid) {
+   108→   108→ const expiresAt = daysValid ? new Date(Date.now() + daysValid * 86400000) : null;
+   109→   109→ const sub = await Subscriber.findOneAndUpdate(
+   110→   110→   { telegramUserId },
+   111→   111→   { telegramUserId, username: username || '', firstName: firstName || '', active: true, subscribedAt: new Date(), expiresAt },
+   112→   112→   { upsert: true, new: true }
+   113→   113→ );
+   114→   114→ return sub;
+   115→   115→}
+   116→   116→
+   117→   117→async function removeSubscriber(telegramUserId) {
+   118→   118→ return Subscriber.findOneAndUpdate({ telegramUserId }, { active: false });
+   119→   119→}
+   120→   120→
+   121→   121→async function listSubscribers() {
+   122→   122→ return Subscriber.find({ active: true }).sort({ subscribedAt: -1 });
+   123→   123→}
+   124→   124→
+   125→   125→// Filter active autopilot symbols to maximize returns and eliminate noise
+   126→   126→const AUTOPILOT_SYMBOLS = ['BTCUSDT', 'XAUUSD', 'GBPUSD', 'USDCAD'];
+   127→   127→
+   128→   128→// Per-symbol Twelve Data API keys (OANDA-grade forex/metals that match TradingView).
+   129→   129→// Read from environment so keys stay server-side and out of the public repo/bundle.
+   130→   130→// A symbol with no key transparently falls back to Yahoo.
+   131→   131→const TWELVEDATA_KEYS = {
+   132→   132→  XAUUSD: process.env.TWELVEDATA_KEY_XAUUSD,
+   133→   133→  GBPUSD: process.env.TWELVEDATA_KEY_GBPUSD,
+   134→   134→  USDCAD: process.env.TWELVEDATA_KEY_USDCAD,
+   135→   135→};
+   136→   136→const getTdKey = (symbol) => TWELVEDATA_KEYS[symbol] || null;
+   137→   137→
+   138→   138→const dbManager = new DBManager();
+   139→   139→const tradeManager = new TradeManager({ isServer: true, db: dbManager });
+   140→   140→
+   141→   141→// State caching for background scanners
+   142→   142→const historyMap = {};
+   143→   143→const livePrices = {};
+   144→   144→const streams = {};
+   145→   145→const lastUpdate = {};    // last time each symbol's feed delivered data (ms)
+   146→   146→const staleAlerted = {};  // de-dupe flag for feed-stale Telegram alerts
+   147→   147→const lastScannedCandleTime = {};
+   148→   148→
+   149→   149→// Helper delay utility
+   150→   150→const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+   151→   151→
+   152→   152→// --------------------------------------------------------------------
+   153→   153→//  Telegram Web App Auth (initData verification)
+   154→   154→// --------------------------------------------------------------------
+   155→   155→function verifyTelegramInitData(initData) {
+   156→   156→  if (!initData || !BOT_TOKEN) return false;
+   157→   157→  try {
+   158→   158→    const params = new URLSearchParams(initData);
+   159→   159→    const hash = params.get('hash');
+   160→   160→    if (!hash) return false;
+   161→   161→    params.delete('hash');
+   162→   162→    const dataCheckString = [...params.entries()]
+   163→   163→      .sort(([a], [b]) => a.localeCompare(b))
+   164→   164→      .map(([k, v]) => `${k}=${v}`)
+   165→   165→      .join('\n');
+   166→   166→    const secretKey = crypto.createHash('sha256').update(BOT_TOKEN).digest();
+   167→   167→    const hmac = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+   168→   168→    return hmac === hash;
+   169→   169→  } catch { return false; }
+   170→   170→}
+   171→   171→
+   172→   172→function validateSession(req) {
+   173→   173→  const auth = req.headers['authorization'];
+   174→   174→  if (!auth || !auth.startsWith('Bearer ')) return false;
+   175→   175→  const token = auth.slice(7);
+   176→   176→  const session = activeSessions.get(token);
+   177→   177→  if (!session) return false;
+   178→   178→  if (Date.now() > session.expiresAt) { activeSessions.delete(token); return false; }
+   179→   179→  return true;
+   180→   180→}
+   181→   181→
+   182→   182→// --------------------------------------------------------------------
+   183→   183→//  Background 24/7 Scanning and Feed Handlers
+   184→   184→// --------------------------------------------------------------------
+   185→   185→
+   186→   186→async function loadHistoryForSymbol(symbol) {
+   187→   187→  try {
+   188→   188→    const candles = await fetchCandles(symbol, TIMEFRAME);
+   189→   189→    
+   190→   190→    if (candles && candles.length > 0) {
+   191→   191→      historyMap[symbol] = candles;
+   192→   192→      livePrices[symbol] = candles[candles.length - 1].close;
+   193→   193→      console.log(`[Autopilot] Loaded ${candles.length} historical candles for ${symbol}. Current Price: $${livePrices[symbol]}`);
+   194→   194→    }
+   195→   195→  } catch (err) {
+   196→   196→    console.error(`[Autopilot] Failed to load history for ${symbol}:`, err.message);
+   197→   197→  }
+   198→   198→}
+   199→   199→
+   200→   200→function handleTick(symbol, price) {
+   201→   201→  if (livePrices[symbol] === price) return;
+   202→   202→  livePrices[symbol] = price;
+   203→   203→
+   204→   204→  // 1. Feed to trade manager to check SL/TP/Partial exits in real-time
+   205→   205→  tradeManager.updatePrices(price, symbol);
+   206→   206→
+   207→   207→  // 2. Perform live exit suggestions / warnings updates on active trades of this symbol
+   208→   208→  const activeTrades = tradeManager.activeTrades.filter(t => t.symbol === symbol && t.status === 'active');
+   209→   209→  if (activeTrades.length > 0 && historyMap[symbol] && historyMap[symbol].length > 0) {
+   210→   210→    const candlesCopy = [...historyMap[symbol]];
+   211→   211→    const lastIdx = candlesCopy.length - 1;
+   212→   212→    candlesCopy[lastIdx] = {
+   213→   213→      ...candlesCopy[lastIdx],
+   214→   214→      close: price,
+   215→   215→      high: Math.max(candlesCopy[lastIdx].high, price),
+   216→   216→      low: Math.min(candlesCopy[lastIdx].low, price),
+   217→   217→    };
+   218→   218→
+   219→   219→    for (const trade of activeTrades) {
+   220→   220→      const exitAnalysis = analyzeExit(candlesCopy, trade);
+   221→   221→      tradeManager.updateExitAnalysis(trade.id, exitAnalysis);
+   222→   222→    }
+   223→   223→  }
+   224→   224→}
+   225→   225→
+   226→   226→function handleCandleUpdate(symbol, candle) {
+   227→   227→  lastUpdate[symbol] = Date.now();
+   228→   228→  if (!historyMap[symbol]) historyMap[symbol] = [];
+   229→   229→  const history = historyMap[symbol];
+   230→   230→
+   231→   231→  const lastIndex = history.findIndex(c => c.time === candle.time);
+   232→   232→  if (lastIndex !== -1) {
+   233→   233→    history[lastIndex] = { ...candle };
+   234→   234→  } else {
+   235→   235→    // Transition detected! A new candle has started.
+   236→   236→    // The previous candle in history is now closed and finalized.
+   237→   237→    if (history.length > 0) {
+   238→   238→      const closedCandle = history[history.length - 1];
+   239→   239→      closedCandle.isClosed = true;
+   240→   240→      console.log(`[Autopilot] Transition detected: Candle CLOSED for ${symbol} at ${new Date(closedCandle.time * 1000).toLocaleTimeString()}. Recalculating setups.`);
+   241→   241→      runScannersForSymbol(symbol);
+   242→   242→    }
+   243→   243→
+   244→   244→    history.push({ ...candle });
+   245→   245→    if (history.length > 1000) history.shift();
+   246→   246→  }
+   247→   247→
+   248→   248→  // If candle is explicitly marked closed (e.g. from Yahoo polling ticks), run the scan
+   249→   249→  if (candle.isClosed) {
+   250→   250→    console.log(`[Autopilot] Candle CLOSED for ${symbol} at ${new Date().toLocaleTimeString()}. Recalculating setups.`);
+   251→   251→    runScannersForSymbol(symbol);
+   252→   252→  }
+   253→   253→}
+   254→   254→
+   255→   255→function runScannersForSymbol(symbol) {
+   256→   256→  const candles = historyMap[symbol];
+   257→   257→  if (!candles || candles.length < 50) {
+   258→   258→    console.warn(`[Autopilot] Insufficient candles to scan ${symbol}`);
+   259→   259→    return;
+   260→   260→  }
+   261→   261→
+   262→   262→  const latestCandle = candles[candles.length - 1];
+   263→   263→  if (lastScannedCandleTime[symbol] === latestCandle.time) {
+   264→   264→    return; // Already scanned this candle
+   265→   265→  }
+   266→   266→  lastScannedCandleTime[symbol] = latestCandle.time;
+   267→   267→
+   268→   268→  // Prevent opening trades if symbol has active trade or is in 10-minute cooldown
+   269→   269→  const hasActiveTrade = tradeManager.activeTrades.some(t => t.symbol === symbol && t.status === 'active');
+   270→   270→  if (hasActiveTrade) return;
+   271→   271→
+   272→   272→  if (!AUTOPILOT_SYMBOLS.includes(symbol)) {
+   273→   273→    return; // Exclude unprofitable symbols from auto-trading
+   274→   274→  }
+   275→   275→
+   276→   276→  if (tradeManager.isSymbolCoolingDown(symbol)) {
+   277→   277→    console.log(`[Autopilot] Skipping ${symbol} scan due to 10-minute post-close cooldown.`);
+   278→   278→    return;
+   279→   279→  }
+   280→   280→
+   281→   281→  try {
+   282→   282→    let signals = generateSignals(candles, symbol, tradeManager.dailyLosses, LIVE_STRATEGY_OPTS);
+   283→   283→    
+   284→   284→    // Strict quality guards
+   285→   285→    signals = signals.filter(sig => ['A', 'B'].includes(sig.quality));
+   286→   286→    signals = signals.filter(sig => !tradeManager.activeTrades.some(t => t.symbol === sig.symbol && t.status === 'active'));
+   287→   287→    signals = signals.filter(sig => !tradeManager.isSymbolCoolingDown(sig.symbol));
+   288→   288→
+   289→   289→    if (signals.length > 0) {
+   290→   290→      const bestSignal = signals[0];
+   291→   291→      const latestCandle = candles[candles.length - 1];
+   292→   292→
+   293→   293→      // Block same-candle executions
+   294→   294→      if (!tradeManager.wasAlreadyExecuted(symbol, latestCandle.time)) {
+   295→   295→        console.log(`[Autopilot] 🎯 high-probability Grade ${bestSignal.quality} setup scanned for ${symbol}! Auto-executing:`, bestSignal);
+   296→   296→        tradeManager.takeTrade(bestSignal, latestCandle.time);
+   297→   297→      }
+   298→   298→    }
+   299→   299→  } catch (err) {
+   300→   300→    console.error(`[Autopilot] Error running signal scan for ${symbol}:`, err);
+   301→   301→  }
+   302→   302→}
+   303→   303→
+   304→   304→// Poll Twelve Data for one symbol on its own dedicated key. Free tier allows
+   305→   305→// 800 calls/day, so a 120s cadence (~720/day) stays safely under the limit while
+   306→   306→// still tracking 15m candles. Backs off on errors so a hiccup never hammers the API.
+   307→   307→function startTwelveDataPoller(symbol, apiKey, basePollMs = 120000) {
+   308→   308→  let currentMs = basePollMs;
+   309→   309→  const maxMs = 600000;
+   310→   310→  let stopped = false;
+   311→   311→
+   312→   312→  async function loop() {
+   313→   313→    if (stopped) return;
+   314→   314→    let ok = false;
+   315→   315→    try {
+   316→   316→      const candles = await fetchTwelveCandles(symbol, TIMEFRAME, 10, apiKey);
+   317→   317→      if (candles && candles.length > 0) {
+   318→   318→        ok = true;
+   319→   319→        const latest = candles[candles.length - 1];
+   320→   320→        handleTick(symbol, latest.close);
+   321→   321→        
+   322→   322→        const durationMap = {
+   323→   323→          '1m': 60,
+   324→   324→          '5m': 300,
+   325→   325→          '15m': 900,
+   326→   326→          '1H': 3600,
+   327→   327→          '4H': 14400,
+   328→   328→          '1D': 86400,
+   329→   329→        };
+   330→   330→        const tfSec = durationMap[TIMEFRAME] || 900;
+   331→   331→        
+   332→   332→        handleCandleUpdate(symbol, {
+   333→   333→          ...latest,
+   334→   334→          isClosed: (Math.floor(Date.now() / 1000) - latest.time) >= tfSec,
+   335→   335→        });
+   336→   336→      }
+   337→   337→    } catch (err) {
+   338→   338→      console.error(`[TwelveData] poll failed for ${symbol}:`, err.message);
+   339→   339→    }
+   340→   340→    currentMs = ok ? basePollMs : Math.min(maxMs, Math.round(currentMs * 1.8));
+   341→   341→    if (!stopped) setTimeout(loop, currentMs);
+   342→   342→  }
+   343→   343→
+   344→   344→  setTimeout(loop, 0);
+   345→   345→  streams[symbol] = { unsubscribe: () => { stopped = true; } };
+   346→   346→}
+   347→   347→
+   348→   348→// --------------------------------------------------------------------
+   349→   349→//  Feed health monitoring (weekend-aware)
+   350→   350→// --------------------------------------------------------------------
+   351→   351→function isForexOpen(now = new Date()) {
+   352→   352→  const day = now.getUTCDay(); // 0 Sun .. 6 Sat
+   353→   353→  const h = now.getUTCHours();
+   354→   354→  if (day === 6) return false;             // Saturday: closed
+   355→   355→  if (day === 0 && h < 22) return false;   // Sunday before ~22:00 UTC
+   356→   356→  if (day === 5 && h >= 21) return false;  // Friday after ~21:00 UTC
+   357→   357→  return true;
+   358→   358→}
+   359→   359→function feedExpectedLive(symbol) {
+   360→   360→  return symbol === 'BTCUSDT' ? true : isForexOpen();
+   361→   361→}
+   362→   362→const STALE_SECONDS = 20 * 60;
+   363→   363→function checkFeedHealth() {
+   364→   364→  for (const symbol of SYMBOLS) {
+   365→   365→    const last = lastUpdate[symbol];
+   366→   366→    const ageSec = last ? (Date.now() - last) / 1000 : Infinity;
+   367→   367→    const stale = ageSec > STALE_SECONDS && feedExpectedLive(symbol);
+   368→   368→    if (stale && !staleAlerted[symbol]) {
+   369→   369→      staleAlerted[symbol] = true;
+   370→   370→      console.warn(`[FeedHealth] ${symbol} feed stale (${Math.round(ageSec / 60)} min).`);
+   371→   371→      sendTelegramMessage(`⚠️ <b>FEED STALE</b>\n\n<code>${symbol}</code> has not updated in <b>${Math.round(ageSec / 60)} min</b> while its market should be open. Check the data feed / Twelve Data key.`);
+   372→   372→    } else if (!stale && staleAlerted[symbol]) {
+   373→   373→      staleAlerted[symbol] = false;
+   374→   374→      sendTelegramMessage(`✅ <b>FEED RECOVERED</b>\n\n<code>${symbol}</code> is updating again.`);
+   375→   375→    }
+   376→   376→  }
+   377→   377→}
+   378→   378→
+   379→   379→async function startAutopilot() {
+   380→   380→  console.log('[Autopilot] Initializing feeds (Twelve Data for keyed forex/metals, Yahoo for the rest)...');
+   381→   381→  
+   382→   382→  // 1. Load initial history for all symbols using Yahoo Finance
+   383→   383→  console.log('[Autopilot] Pre-loading historical caches...');
+   384→   384→  for (const symbol of SYMBOLS) {
+   385→   385→    const tdKey = getTdKey(symbol);
+   386→   386→    try {
+   387→   387→      let candles;
+   388→   388→      if (tdKey) {
+   389→   389→        try {
+   390→   390→          candles = await fetchTwelveCandles(symbol, '15m', 500, tdKey);
+   391→   391→          console.log(`[Autopilot] Loaded ${candles.length} Twelve Data candles for ${symbol}.`);
+   392→   392→        } catch (tdErr) {
+   393→   393→          console.error(`[Autopilot] Twelve Data pre-load failed for ${symbol}, falling back to Yahoo:`, tdErr.message);
+   394→   394→          candles = await fetchCandles(symbol, '15m');
+   395→   395→        }
+   396→   396→      } else {
+   397→   397→        candles = await fetchCandles(symbol, '15m');
+   398→   398→      }
+   399→   399→      if (candles && candles.length > 0) {
+   400→   400→        historyMap[symbol] = candles;
+   401→   401→        livePrices[symbol] = candles[candles.length - 1].close;
+   402→   402→        // Immediately calculate active trades' P&L and R:R with the loaded price
+   403→   403→        tradeManager.updatePrices(livePrices[symbol], symbol);
+   404→   404→      }
+   405→   405→    } catch (err) {
+   406→   406→      console.error(`[Autopilot] Pre-load failed for ${symbol}:`, err.message);
+   407→   407→    }
+   408→   408→  }
+   409→   409→
+   410→   410→  // 2. Subscribe to real-time Yahoo streams for all 6 symbols in the background
+   411→   411→  console.log('[Autopilot] Establishing background monitoring feeds...');
+   412→   412→  for (const [idx, symbol] of SYMBOLS.entries()) {
+   413→   413→    const tdKey = getTdKey(symbol);
+   414→   414→    if (tdKey) {
+   415→   415→      // OANDA-grade feed on a dedicated key (broker / TradingView-matching candles).
+   416→   416→      console.log(`[Autopilot] Streaming ${symbol} from Twelve Data (dedicated key).`);
+   417→   417→      startTwelveDataPoller(symbol, tdKey, 120000);
+   418→   418→    } else {
+   419→   419→      const stream = new YahooStream();
+   420→   420→      stream.subscribe(symbol, TIMEFRAME, {
+   421→   421→        onTick: (price) => { handleTick(symbol, price); },
+   422→   422→        onCandleUpdate: (candle) => { handleCandleUpdate(symbol, candle); },
+   423→   423→      }, { pollMs: 10000, staggerMs: idx * 1500 });
+   424→   424→      streams[symbol] = stream;
+   425→   425→    }
+   426→   426→  }
+   427→   427→
+   428→   428→  console.log(`[Server Autopilot] Startup complete. Timeframe: ${TIMEFRAME}. Autopilot active for: ${AUTOPILOT_SYMBOLS.join(', ')}.`);
+   429→   429→
+   430→   430→  // Monitor feed liveness; alert (weekend-aware) if a feed stalls during market hours.
+   431→   431→  setInterval(checkFeedHealth, 5 * 60 * 1000);
+   432→   432→}
+   433→   433→
+   434→   434→// --------------------------------------------------------------------
+   435→   435→//  Telegram Bot Webhook & Commands
+   436→   436→// --------------------------------------------------------------------
+   437→   437→app.post('/api/telegram-webhook', async (req, res) => {
+   438→   438→  try {
+   439→   439→    const update = req.body;
+   440→   440→    if (!update.message || !update.message.text) return res.sendStatus(200);
+   441→   441→
+   442→   442→    const chatId = update.message.chat.id;
+   443→   443→    const senderId = update.message.from?.id;
+   444→   444→    const senderName = update.message.from?.first_name || '';
+   445→   445→    const senderUsername = update.message.from?.username || '';
+   446→   446→    const text = update.message.text.trim();
+   447→   447→
+   448→   448→    // Helper to send Telegram message
+   449→   449→    async function sendTG(chatId, text, replyMarkup) {
+   450→   450→      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+   451→   451→        method: 'POST',
+   452→   452→        headers: { 'Content-Type': 'application/json' },
+   453→   453→        body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', ...(replyMarkup ? { reply_markup: replyMarkup } : {}) }),
+   454→   454→      });
+   455→   455→    }
+   456→   456→
+   457→   457→    // --- /start and /dashboard: open web app ---
+   458→   458→    if (text === '/start' || text === '/dashboard') {
+   459→   459→      const webAppUrl = WEBAPP_URL || `${process.env.RENDER_EXTERNAL_URL || ''}`;
+   460→   460→      if (!webAppUrl) { await sendTG(chatId, 'WEBAPP_URL belum dikonfigurasi.'); return res.sendStatus(200); }
+   461→   461→      await sendTG(chatId,
+   462→   462→        '\u{1F4CA} <b>Trade Analyzer Dashboard</b>\n\nKlik tombol di bawah untuk membuka dashboard.',
+   463→   463→        { inline_keyboard: [[{ text: '\u{1F680} Buka Dashboard', web_app: { url: webAppUrl } }]] }
+   464→   464→      );
+   465→   465→      return res.sendStatus(200);
+   466→   466→    }
+   467→   467→
+   468→   468→    // --- Admin commands (only ADMIN_ID) ---
+   469→   469→    if (ADMIN_ID && senderId !== ADMIN_ID) {
+   470→   470→      res.sendStatus(200);
+   471→   471→      return;
+   472→   472→    }
+   473→   473→
+   474→   474→    // /adduser <telegram_id> [hari] — tambah pelanggan
+   475→   475→    if (text.startsWith('/adduser ')) {
+   476→   476→      const parts = text.split(' ');
+   477→   477→      const targetId = Number(parts[1]);
+   478→   478→      const days = Number(parts[2]) || 30;
+   479→   479→      if (!targetId) { await sendTG(chatId, 'Format: /adduser <telegram_id> [hari]\nContoh: /adduser 123456789 30'); return res.sendStatus(200); }
+   480→   480→      await addSubscriber(targetId, '', '', days);
+   481→   481→      await sendTG(chatId, `\u2705 Pelanggan <code>${targetId}</code> ditambahkan (${days} hari).`);
+   482→   482→      return res.sendStatus(200);
+   483→   483→    }
+   484→   484→
+   485→   485→    // /removeuser <telegram_id> — hapus pelanggan
+   486→   486→    if (text.startsWith('/removeuser ')) {
+   487→   487→      const targetId = Number(text.split(' ')[1]);
+   488→   488→      if (!targetId) { await sendTG(chatId, 'Format: /removeuser <telegram_id>'); return res.sendStatus(200); }
+   489→   489→      await removeSubscriber(targetId);
+   490→   490→      await sendTG(chatId, `\u274C Pelanggan <code>${targetId}</code> dihapus.`);
+   491→   491→      return res.sendStatus(200);
+   492→   492→    }
+   493→   493→
+   494→   494→    // /subs — list semua pelanggan aktif
+   495→   495→    if (text === '/subs') {
+   496→   496→      const subs = await listSubscribers();
+   497→   497→      if (subs.length === 0) { await sendTG(chatId, 'Belum ada pelanggan aktif.'); return res.sendStatus(200); }
+   498→   498→      let list = `\u{1F4CB} <b>Pelanggan Aktif (${subs.length})</b>\n\n`;
+   499→   499→      for (const s of subs) {
+   500→   500→        const exp = s.expiresAt ? ` | exp: ${s.expiresAt.toLocaleDateString('id-ID')}` : ' | lifetime';
+   501→   501→        list += `<code>${s.telegramUserId}</code> @${s.username || '-'} ${s.firstName}${exp}\n`;
+   502→   502→      }
+   503→   503→      await sendTG(chatId, list);
+   504→   504→      return res.sendStatus(200);
+   505→   505→    }
+   506→   506→
+   507→   507→    // /myid — cek ID sendiri
+   508→   508→    if (text === '/myid') {
+   509→   509→      await sendTG(chatId, `ID Anda: <code>${senderId}</code>\nUsername: @${senderUsername || '-'}\nNama: ${senderName}`);
+   510→   510→      return res.sendStatus(200);
+   511→   511→    }
+   512→   512→
+   513→   513→    res.sendStatus(200);
+   514→   514→  } catch (err) {
+   515→   515→    console.error('[Telegram Webhook] Error:', err.message);
+   516→   516→    res.sendStatus(500);
+   517→   517→  }
+   518→   518→});
+   519→   519→
+   520→   520→// Web App auth endpoint (checks subscription)
+   521→   521→app.post('/api/auth-tg', async (req, res) => {
+   522→   522→  const { initData } = req.body;
+   523→   523→  if (!initData || !verifyTelegramInitData(initData)) {
+   524→   524→    return res.status(401).json({ error: 'Unauthorized' });
+   525→   525→  }
+   526→   526→  const params = new URLSearchParams(initData);
+   527→   527→  let user = {};
+   528→   528→  try { user = JSON.parse(params.get('user') || '{}'); } catch {}
+   529→   529→
+   530→   530→  // Check subscription (skip if no BOT_TOKEN = dev mode)
+   531→   531→  if (BOT_TOKEN) {
+   532→   532→    const subscribed = await isSubscriber(user.id);
+   533→   533→    if (!subscribed) {
+   534→   534→      return res.json({ success: false, subscribed: false, message: 'Anda belum berlangganan.' });
+   535→   535→    }
+   536→   536→  }
+   537→   537→
+   538→   538→  const token = crypto.randomBytes(32).toString('hex');
+   539→   539→  activeSessions.set(token, { userId: user.id, username: user.username, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
+   540→   540→  res.json({ success: true, subscribed: true, token, user });
+   541→   541→});
+   542→   542→
+   543→   543→// Register webhook with Telegram on startup
+   544→   544→async function registerTelegramWebhook() {
+   545→   545→  if (!BOT_TOKEN) { console.log('[Telegram] No BOT_TOKEN, skipping webhook registration.'); return; }
+   546→   546→  const baseUrl = process.env.RENDER_EXTERNAL_URL;
+   547→   547→  if (!baseUrl) { console.log('[Telegram] No RENDER_EXTERNAL_URL, skipping webhook.'); return; }
+   548→   548→  const webhookUrl = `${baseUrl}/api/telegram-webhook`;
+   549→   549→  try {
+   550→   550→    const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+   551→   551→      method: 'POST',
+   552→   552→      headers: { 'Content-Type': 'application/json' },
+   553→   553→      body: JSON.stringify({ url: webhookUrl }),
+   554→   554→    });
+   555→   555→    const data = await r.json();
+   556→   556→    if (data.ok) console.log(`[Telegram] Webhook registered: ${webhookUrl}`);
+   557→   557→    else console.error('[Telegram] Webhook registration failed:', data.description);
+   558→   558→  } catch (err) {
+   559→   559→    console.error('[Telegram] Webhook registration error:', err.message);
+   560→   560→  }
+   561→   561→}
+   562→   562→
+   563→   563→// --------------------------------------------------------------------
+   564→   564→//  API Routing (protected by session auth when BOT_TOKEN is set)
+   565→   565→// --------------------------------------------------------------------
+   566→   566→
+   567→   567→// Auth middleware for data API routes
+   568→   568→function requireAuth(req, res, next) {
+   569→   569→  if (!BOT_TOKEN) return next(); // Dev mode: skip auth
+   570→   570→  if (validateSession(req)) return next();
+   571→   571→  res.status(403).json({ error: 'Akses ditolak. Buka dashboard melalui Telegram.' });
+   572→   572→}
+   573→   573→
+   574→   574→// Routes that are always public
+   575→   575→// (webhook, auth, test-telegram, proxy routes — no protection needed)
+   576→   576→
+   577→   577→// Protected data routes
+   578→   578→app.get('/api/terminal-state', requireAuth, (req, res) => {
+   579→   579→  res.json({
+   580→   580→    activeTrades: tradeManager.activeTrades,
+   581→   581→    tradeHistory: tradeManager.tradeHistory,
+   582→   582→    accountBalance: tradeManager.accountBalance,
+   583→   583→    dailyLosses: tradeManager.dailyLosses,
+   584→   584→    lastClosedTime: tradeManager.lastClosedTime,
+   585→   585→    lastExecutedCandleTime: tradeManager.lastExecutedCandleTime,
+   586→   586→    twelveDataActive: false,
+   587→   587→    feeds: Object.fromEntries(SYMBOLS.map(s => [s, lastUpdate[s] ? Math.floor((Date.now() - lastUpdate[s]) / 1000) : null])),
+   588→   588→  });
+   589→   589→});
+   590→   590→
+   591→   591→// Cached market data: browsers read candles + live price from the server's own
+   592→   592→// poller cache instead of each hitting Yahoo. Reads in-memory state, no upstream call.
+   593→   593→app.get('/api/market-data', requireAuth, (req, res) => {
+   594→   594→  const symbol = req.query.symbol;
+   595→   595→  const rawCandles = (symbol && historyMap[symbol]) ? historyMap[symbol].slice(-500) : [];
+   596→   596→  // Re-apply the forex outlier-wick filter on read, so candles cached in memory
+   597→   597→  // before this fix (or any stray glitch bar) are cleaned without a full restart.
+   598→   598→  // Twelve Data is already broker-clean, so only the Yahoo path needs wick scrubbing.
+   599→   599→  const candles = getTdKey(symbol) ? rawCandles : filterForexOutlierWicks(rawCandles, symbol);
+   600→   600→  
+   601→   601→  // Prevent browser caching of real-time market data
+   602→   602→  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+   603→   603→  res.setHeader('Pragma', 'no-cache');
+   604→   604→  res.setHeader('Expires', '0');
+   605→   605→
+   606→   606→  res.json({
+   607→   607→    symbol: symbol || null,
+   608→   608→    candles,
+   609→   609→    price: (symbol && livePrices[symbol] != null) ? livePrices[symbol] : null,
+   610→   610→    serverTime: Math.floor(Date.now() / 1000),
+   611→   611→  });
+   612→   612→});
+   613→   613→
+   614→   614→app.post('/api/take-trade', async (req, res) => {
+   615→   615→  const { signal } = req.body;
+   616→   616→  if (!signal) {
+   617→   617→    return res.status(400).json({ error: 'Signal structure required' });
+   618→   618→  }
+   619→   619→  // takeTrade is async and resolves to null when the trade is rejected
+   620→   620→  // (duplicate symbol, cooldown, etc.) — await it so success reflects reality.
+   621→   621→  const trade = await tradeManager.takeTrade(signal);
+   622→   622→  res.json({ success: !!trade, trade: trade || null });
+   623→   623→});
+   624→   624→
+   625→   625→app.post('/api/manual-close', (req, res) => {
+   626→   626→  const { tradeId } = req.body;
+   627→   627→  if (tradeId === undefined) {
+   628→   628→    return res.status(400).json({ error: 'Trade ID required' });
+   629→   629→  }
+   630→   630→  tradeManager.manualClose(Number(tradeId));
+   631→   631→  res.json({ success: true, message: `Trade ${tradeId} closed successfully.` });
+   632→   632→});
+   633→   633→
+   634→   634→app.post('/api/reset-account', (req, res) => {
+   635→   635→  tradeManager.resetAccount();
+   636→   636→  res.json({ success: true, message: 'Terminal account state reset completely.' });
+   637→   637→});
+   638→   638→
+   639→   639→app.get('/api/test-telegram', async (req, res) => {
+   640→   640→  const token = process.env.TELEGRAM_BOT_TOKEN;
+   641→   641→  const chatId = process.env.TELEGRAM_CHAT_ID;
+   642→   642→
+   643→   643→  if (!token || !chatId) {
+   644→   644→    return res.status(400).json({
+   645→   645→      success: false,
+   646→   646→      error: `Missing credentials. Token: ${token ? 'configured' : 'MISSING'}, Chat ID: ${chatId ? 'configured' : 'MISSING'}`
+   647→   647→    });
+   648→   648→  }
+   649→   649→
+   650→   650→  try {
+   651→   651→    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+   652→   652→    const msg = `🔔 <b>Trade Analyzer Connection Test</b>\n\n` +
+   653→   653→                `<b>Status:</b> 🟢 Connected successfully!\n` +
+   654→   654→                `<b>Source:</b> 🚀 Triggered from Hugging Face Server\n` +
+   655→   655→                `<b>Time:</b> <code>${new Date().toLocaleString()}</code>\n\n` +
+   656→   656→                `This confirms your Telegram configuration is working perfectly.`;
+   657→   657→                
+   658→   658→    const telegramRes = await fetch(url, {
+   659→   659→      method: 'POST',
+   660→   660→      headers: { 'Content-Type': 'application/json' },
+   661→   661→      body: JSON.stringify({
+   662→   662→        chat_id: chatId,
+   663→   663→        text: msg,
+   664→   664→        parse_mode: 'HTML',
+   665→   665→      }),
+   666→   666→    });
+   667→   667→
+   668→   668→    const data = await telegramRes.json();
+   669→   669→    if (telegramRes.ok && data.ok) {
+   670→   670→      res.json({ success: true, message: 'Test message sent to Telegram successfully.', data });
+   671→   671→    } else {
+   672→   672→      res.status(400).json({ success: false, error: data.description || 'Telegram API Error', data });
+   673→   673→    }
+   674→   674→  } catch (err) {
+   675→   675→    res.status(500).json({ success: false, error: err.message });
+   676→   676→  }
+   677→   677→});
+   678→   678→
+   679→   679→// Proxy routes for client-side fetches (Bypasses CORS natively)
+   680→   680→app.use('/api/binance', async (req, res) => {
+   681→   681→  try {
+   682→   682→    const targetUrl = 'https://api.binance.com' + req.originalUrl.replace(/^\/api\/binance/, '');
+   683→   683→    const response = await fetch(targetUrl);
+   684→   684→    res.status(response.status);
+   685→   685→    const data = await response.text();
+   686→   686→    res.send(data);
+   687→   687→  } catch (err) {
+   688→   688→    res.status(500).send(err.message);
+   689→   689→  }
+   690→   690→});
+   691→   691→
+   692→   692→app.use('/api/yahoo', async (req, res) => {
+   693→   693→  try {
+   694→   694→    const targetUrl = 'https://query1.finance.yahoo.com' + req.originalUrl.replace(/^\/api\/yahoo/, '');
+   695→   695→    const response = await fetch(targetUrl, {
+   696→   696→      headers: {
+   697→   697→        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+   698→   698→        'Origin': 'https://finance.yahoo.com',
+   699→   699→        'Referer': 'https://finance.yahoo.com',
+   700→   700→      }
+   701→   701→    });
+   702→   702→    res.status(response.status);
+   703→   703→    const data = await response.text();
+   704→   704→    res.send(data);
+   705→   705→  } catch (err) {
+   706→   706→    res.status(500).send(err.message);
+   707→   707→  }
+   708→   708→});
+   709→   709→
+   710→   710→app.use('/api/swissquote', async (req, res) => {
+   711→   711→  try {
+   712→   712→    const targetUrl = 'https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD';
+   713→   713→    const response = await fetch(targetUrl);
+   714→   714→    res.status(response.status);
+   715→   715→    const data = await response.text();
+   716→   716→    res.send(data);
+   717→   717→  } catch (err) {
+   718→   718→    res.status(500).send(err.message);
+   719→   719→  }
+   720→   720→});
+   721→   721→
+   722→   722→// --------------------------------------------------------------------
+   723→   723→//  Static Asset hosting (Production deployment build)
+   724→   724→// --------------------------------------------------------------------
+   725→   725→app.use(express.static(path.join(__dirname, 'dist'), {
+   726→   726→  setHeaders: (res, filePath) => {
+   727→   727→    // Hashed JS/CSS bundles are content-addressed and safe to cache forever, but
+   728→   728→    // index.html must never be cached or browsers keep loading the old bundle after
+   729→   729→    // a deploy (the root cause of "I pushed but still see the old version").
+   730→   730→    if (filePath.endsWith('.html')) {
+   731→   731→      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+   732→   732→    }
+   733→   733→  },
+   734→   734→}));
+   735→   735→app.use((req, res) => {
+   736→   736→  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+   737→   737→  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+   738→   738→});
+   739→   739→
+   740→   740→// --------------------------------------------------------------------
+   741→   741→//  Scheduled Telegram Report (every 15 minutes)
+   742→   742→// --------------------------------------------------------------------
+   743→   743→const TREND_EMOJI = {
+   744→   744→  strong_bullish: '\U0001f7e2\U0001f7e2', bullish: '\U0001f7e2', ranging: '\U0001f7e1', bearish: '\U0001f534', strong_bearish: '\U0001f534\U0001f534',
+   745→   745→};
+   746→   746→
+   747→   747→function sendScheduledReport() {
+   748→   748→  const now = new Date();
+   749→   749→  const timeStr = now.toLocaleString('en-GB', { timeZone: 'Asia/Jakarta', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+   750→   750→
+   751→   751→  let msg = `\u{1F4CA} <b>TRADE ANALYZOR \u2014 MARKET REPORT</b>\n`;
+   752→   752→  msg += `\u{1F550} <code>${timeStr} WIB</code>\n`;
+   753→   753→  msg += `\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n`;
+   754→   754→
+   755→   755→  for (const symbol of SYMBOLS) {
+   756→   756→    const candles = historyMap[symbol];
+   757→   757→    const price = livePrices[symbol];
+   758→   758→    if (!candles || candles.length < 50 || !price) {
+   759→   759→      msg += `\u{1F538} <b>${symbol}</b>\n\u23F3 Data belum tersedia\n\n`;
+   760→   760→      continue;
+   761→   761→    }
+   762→   762→
+   763→   763→    const closes = candles.map(c => c.close);
+   764→   764→    const trend = analyzeTrend(candles);
+   765→   765→    const rsiVals = rsi(closes);
+   766→   766→    const macdData = macd(closes);
+   767→   767→    const atrVals = atr(candles);
+   768→   768→    const bb = bollingerBands(closes);
+   769→   769→    const ema21Vals = ema(closes, 21);
+   770→   770→    const ema50Vals = ema(closes, 50);
+   771→   771→
+   772→   772→    const lastRSI = rsiVals[rsiVals.length - 1];
+   773→   773→    const lastMACD = macdData.macdLine[macdData.macdLine.length - 1];
+   774→   774→    const lastSignal = macdData.signalLine[macdData.signalLine.length - 1];
+   775→   775→    const lastHist = macdData.histogram[macdData.histogram.length - 1];
+   776→   776→    const lastATR = atrVals[atrVals.length - 1];
+   777→   777→    const lastBBUpper = bb.upper[bb.upper.length - 1];
+   778→   778→    const lastBBLower = bb.lower[bb.lower.length - 1];
+   779→   779→    const lastEma21 = ema21Vals[ema21Vals.length - 1];
+   780→   780→    const lastEma50 = ema50Vals[ema50Vals.length - 1];
+   781→   781→
+   782→   782→    let rsiLabel = 'NETRAL';
+   783→   783→    if (lastRSI > 70) rsiLabel = '\u{1F7E2} OVERBOUGHT';
+   784→   784→    else if (lastRSI < 30) rsiLabel = '\u{1F534} OVERSOLD';
+   785→   785→    else if (lastRSI > 55) rsiLabel = '\u{1F7E2} Bullish';
+   786→   786→    else if (lastRSI < 45) rsiLabel = '\u{1F534} Bearish';
+   787→   787→
+   788→   788→    let macdLabel = '-';
+   789→   789→    if (!isNaN(lastHist)) {
+   790→   790→      if (lastHist > 0 && lastMACD > lastSignal) macdLabel = '\u{1F7E2} Bullish';
+   791→   791→      else if (lastHist < 0 && lastMACD < lastSignal) macdLabel = '\u{1F534} Bearish';
+   792→   792→    }
+   793→   793→
+   794→   794→    let bbPos = '-';
+   795→   795→    if (!isNaN(lastBBUpper) && !isNaN(lastBBLower)) {
+   796→   796→      const bbRange = lastBBUpper - lastBBLower;
+   797→   797→      if (bbRange > 0) {
+   798→   798→        const pct = ((price - lastBBLower) / bbRange * 100).toFixed(0);
+   799→   799→        bbPos = pct + '% band';
+   800→   800→        if (price >= lastBBUpper) bbPos = '\u{1F525} Upper band';
+   801→   801→        else if (price <= lastBBLower) bbPos = '\u2744\uFE0F Lower band';
+   802→   802→      }
+   803→   803→    }
+   804→   804→
+   805→   805→    const dp = symbol === 'BTCUSDT' ? 0 : symbol === 'XAUUSD' ? 2 : 5;
+   806→   806→    const trendEmoji = TREND_EMOJI[trend.direction] || '\u{1F7E1}';
+   807→   807→    const trendLabel = trend.direction.replace('_', ' ').toUpperCase();
+   808→   808→
+   809→   809→    msg += `\u{1F538} <b>${symbol}</b>  <code>$${price.toFixed(dp)}</code>\n`;
+   810→   810→    msg += `   Trend: ${trendEmoji} <b>${trendLabel}</b> (${trend.strength}/100)\n`;
+   811→   811→    msg += `   RSI(14): <code>${isNaN(lastRSI) ? '-' : lastRSI.toFixed(1)}</code> ${rsiLabel}\n`;
+   812→   812→    msg += `   MACD: ${macdLabel}\n`;
+   813→   813→    if (!isNaN(lastEma21)) msg += `   EMA21: <code>${lastEma21.toFixed(dp)}</code>  EMA50: <code>${lastEma50.toFixed(dp)}</code>\n`;
+   814→   814→    if (bbPos !== '-') msg += `   BB: ${bbPos}\n`;
+   815→   815→    if (!isNaN(lastATR)) msg += `   ATR(14): <code>${lastATR.toFixed(dp)}</code>\n`;
+   816→   816→
+   817→   817→    const activeTrade = tradeManager.activeTrades.find(t => t.symbol === symbol && t.status === 'active');
+   818→   818→    if (activeTrade) {
+   819→   819→      const pnl = activeTrade.currentPnL || 0;
+   820→   820→      const pnlE = pnl >= 0 ? '\u{1F4B0}' : '\u{1F4C9}';
+   821→   821→      msg += `   ${pnlE} <b>ACTIVE ${activeTrade.type}</b> | P&L: <code>${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</code>\n`;
+   822→   822→    }
+   823→   823→    msg += `\n`;
+   824→   824→  }
+   825→   825→
+   826→   826→  const todayWins = tradeManager.tradeHistory.filter(t => {
+   827→   827→    return new Date(t.closedAt).toDateString() === now.toDateString() && t.profit > 0;
+   828→   828→  }).length;
+   829→   829→  const todayLosses = tradeManager.tradeHistory.filter(t => {
+   830→   830→    return new Date(t.closedAt).toDateString() === now.toDateString() && t.profit <= 0;
+   831→   831→  }).length;
+   832→   832→
+   833→   833→  msg += `\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n`;
+   834→   834→  msg += `\u{1F3E6} <b>ACCOUNT</b>\n`;
+   835→   835→  msg += `   Balance: <code>$${tradeManager.accountBalance.toFixed(2)}</code>\n`;
+   836→   836→  msg += `   Active: <code>${tradeManager.activeTrades.length}</code> | Today: <code>\u2705${todayWins} \u274C${todayLosses}</code>\n`;
+   837→   837→
+   838→   838→  sendTelegramMessage(msg);
+   839→   839→  console.log(`[Telegram Report] Scheduled report sent at ${timeStr}`);
+   840→   840→}
+   841→   841→
+   842→   842→// --------------------------------------------------------------------
+   843→   843→//  Database connection & bootup coordination
+   844→   844→// --------------------------------------------------------------------
+   845→   845→async function bootServer() {
+   846→   846→  const uri = process.env.MONGODB_URI;
+   847→   847→  if (!uri) {
+   848→   848→    console.error('CRITICAL ERROR: MONGODB_URI environment variable is missing.');
+   849→   849→    process.exit(1);
+   850→   850→  }
+   851→   851→
+   852→   852→  try {
+   853→   853→    // 1. Establish Mongo connection & Sync state
+   854→   854→    await dbManager.connect(uri);
+   855→   855→    const state = await dbManager.loadState();
+   856→   856→    
+   857→   857→    // Sync DB into server TradeManager properties
+   858→   858→    tradeManager.activeTrades = state.activeTrades || [];
+   859→   859→    tradeManager.tradeHistory = state.tradeHistory || [];
+   860→   860→    tradeManager.accountBalance = state.accountBalance ?? 5000.0;
+   861→   861→    tradeManager.dailyLosses = state.dailyLosses ?? 0;
+   862→   862→    tradeManager.lastExecutedCandleTime = state.lastExecutedCandleTime || {};
+   863→   863→    tradeManager.lastClosedTime = state.lastClosedTime || {};
+   864→   864→    tradeManager.lastResetDate = state.lastResetDate || new Date().toDateString();
+   865→   865→
+   866→   866→    console.log('[Server] MongoDB terminal state recovered successfully.');
+   867→   867→    console.log(`[Server] Active Positions: ${tradeManager.activeTrades.length} | Balance: $${tradeManager.accountBalance.toFixed(2)}`);
+   868→   868→
+   869→   869→    // 2. Register Telegram webhook for /start and /dashboard commands
+   870→   870→    await registerTelegramWebhook();
+   871→   871→
+   872→   872→    // 3. Start 24/7 scanning feed loops
+   873→   873→    await startAutopilot();
+   874→   874→
+   875→   875→    // 4. Start scheduled Telegram reports every 15 minutes
+   876→   876→    setTimeout(() => {
+   877→   877→      sendScheduledReport();
+   878→   878→      setInterval(sendScheduledReport, 15 * 60 * 1000);
+   879→   879→      console.log('[Server] Telegram scheduled reports active (every 15 minutes).');
+   880→   880→    }, 60 * 1000);
+   881→   881→
+   882→   882→    // 5. Bind HTTP Port listener
+   883→   883→    app.listen(PORT, '0.0.0.0', () => {
+   884→   884→      console.log(`[Server] Trade Analyzer Full-Stack Engine running on port ${PORT}`);
+   885→   885→    });
+   886→   886→  } catch (err) {
+   887→   887→    console.error('Failed to boot terminal backend:', err);
+   888→   888→    process.exit(1);
+   889→   889→  }
+   890→   890→}
+   891→   891→
+   892→   892→bootServer();
+   893→   893→
