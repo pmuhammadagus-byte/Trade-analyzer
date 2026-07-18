@@ -48,7 +48,6 @@ globalThis.fetch = async (input, init) => {
 //  Imports of application code
 // --------------------------------------------------------------------
 import DBManager from './src/data/db.js';
-import mongoose from 'mongoose';
 import TradeManager from './src/components/tradeManager.js';
 import { BinanceStream } from './src/data/binanceWebSocket.js';
 import { YahooStream } from './src/data/yahooWebSocket.js';
@@ -73,61 +72,9 @@ const TIMEFRAME = process.env.AUTOPILOT_TIMEFRAME || '15m';
 const SYMBOLS = ['BTCUSDT', 'XAUUSD', 'GBPUSD', 'USDCAD'];
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const WEBAPP_URL = process.env.TELEGRAM_WEBAPP_URL || '';
-const ADMIN_ID = process.env.ADMIN_TELEGRAM_ID ? Number(process.env.ADMIN_TELEGRAM_ID) : null;
 
-// Subscription pricing (Telegram Stars)
-const SUB_PLANS = [
-  { label: '1 Minggu', days: 7, stars: 50 },
-  { label: '1 Bulan', days: 30, stars: 150 },
-  { label: '3 Bulan', days: 90, stars: 350 },
-];
-
-// Active sessions for Web App auth (token -> { userId, username, expiresAt })
+// Active sessions for Web App auth (userId -> { token, expires })
 const activeSessions = new Map();
-
-// --------------------------------------------------------------------
-//  Subscriber Management (MongoDB)
-// --------------------------------------------------------------------
-const subscriberSchema = new mongoose.Schema({
-  telegramUserId: { type: Number, required: true, unique: true },
-  username: { type: String, default: '' },
-  firstName: { type: String, default: '' },
-  active: { type: Boolean, default: true },
-  subscribedAt: { type: Date, default: Date.now },
-  expiresAt: { type: Date, default: null },
-  notes: { type: String, default: '' },
-});
-const Subscriber = mongoose.model('Subscriber', subscriberSchema);
-
-async function isSubscriber(telegramUserId) {
- if (!telegramUserId) return false;
- const sub = await Subscriber.findOne({ telegramUserId, active: true });
- if (!sub) return false;
- if (sub.expiresAt && sub.expiresAt < new Date()) {
-   sub.active = false;
-   await sub.save();
-   return false;
- }
- return true;
-}
-
-async function addSubscriber(telegramUserId, username, firstName, daysValid) {
- const expiresAt = daysValid ? new Date(Date.now() + daysValid * 86400000) : null;
- const sub = await Subscriber.findOneAndUpdate(
-   { telegramUserId },
-   { telegramUserId, username: username || '', firstName: firstName || '', active: true, subscribedAt: new Date(), expiresAt },
-   { upsert: true, new: true }
- );
- return sub;
-}
-
-async function removeSubscriber(telegramUserId) {
- return Subscriber.findOneAndUpdate({ telegramUserId }, { active: false });
-}
-
-async function listSubscribers() {
- return Subscriber.find({ active: true }).sort({ subscribedAt: -1 });
-}
 
 // Filter active autopilot symbols to maximize returns and eliminate noise
 const AUTOPILOT_SYMBOLS = ['BTCUSDT', 'XAUUSD', 'GBPUSD', 'USDCAD'];
@@ -447,107 +394,37 @@ app.post('/api/telegram-webhook', async (req, res) => {
     if (!update.message || !update.message.text) return res.sendStatus(200);
 
     const chatId = update.message.chat.id;
-    const senderId = update.message.from?.id;
-    const senderName = update.message.from?.first_name || '';
-    const senderUsername = update.message.from?.username || '';
     const text = update.message.text.trim();
 
-    // Helper to send Telegram message
-    async function sendTG(chatId, text, replyMarkup) {
+    if (text === '/start' || text === '/dashboard') {
+      const webAppUrl = WEBAPP_URL || `${process.env.RENDER_EXTERNAL_URL || ''}`;
+      if (!webAppUrl) {
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: 'WEBAPP_URL belum dikonfigurasi di environment variable.',
+          }),
+        });
+        return res.sendStatus(200);
+      }
       await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', ...(replyMarkup ? { reply_markup: replyMarkup } : {}) }),
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: '\u{1F4CA} <b>Trade Analyzer Dashboard</b>\n\nKlik tombol di bawah untuk membuka dashboard analisa trading.',
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [[{
+              text: '\u{1F680} Buka Dashboard',
+              web_app: { url: webAppUrl },
+            }]],
+          },
+        }),
       });
     }
-
-    // --- /start and /dashboard: open web app ---
-    if (text === '/start' || text === '/dashboard') {
-      const webAppUrl = WEBAPP_URL || `${process.env.RENDER_EXTERNAL_URL || ''}`;
-      if (!webAppUrl) { await sendTG(chatId, 'WEBAPP_URL belum dikonfigurasi.'); return res.sendStatus(200); }
-      await sendTG(chatId,
-        '\u{1F4CA} <b>Trade Analyzer Dashboard</b>\n\nKlik tombol di bawah untuk membuka dashboard.',
-        { inline_keyboard: [[{ text: '\u{1F680} Buka Dashboard', web_app: { url: webAppUrl } }]] }
-      );
-      return res.sendStatus(200);
-    }
-
-    // --- Public commands (bisa dipakai semua user) ---
-
-    // /myid — cek ID sendiri
-    if (text === '/myid') {
-      await sendTG(chatId, `ID Anda: <code>${senderId}</code>\nUsername: @${senderUsername || '-'}\nNama: ${senderName}`);
-      return res.sendStatus(200);
-    }
-
-    // /subs — cek status langganan (user biasa) / list semua pelanggan (admin)
-    if (text === '/subs') {
-      if (ADMIN_ID && senderId === ADMIN_ID) {
-        // Admin: tampilkan semua pelanggan aktif
-        const subs = await listSubscribers();
-        if (subs.length === 0) { await sendTG(chatId, 'Belum ada pelanggan aktif.'); return res.sendStatus(200); }
-        let list = `\u{1F4CB} <b>Pelanggan Aktif (${subs.length})</b>\n\n`;
-        for (const s of subs) {
-          const exp = s.expiresAt ? ` | exp: ${s.expiresAt.toLocaleDateString('id-ID')}` : ' | lifetime';
-          list += `<code>${s.telegramUserId}</code> @${s.username || '-'} ${s.firstName}${exp}\n`;
-        }
-        await sendTG(chatId, list);
-      } else {
-        // User biasa: tampilkan status langganan sendiri
-        const sub = await Subscriber.findOne({ telegramUserId: senderId, active: true });
-        if (!sub || (sub.expiresAt && sub.expiresAt < new Date())) {
-          await sendTG(chatId,
-            '\u{1F514} <b>Status Langganan</b>\n\n' +
-            'Anda <b>belum berlangganan</b>.\n\n' +
-            'Hubungi admin untuk mendaftar.'
-          );
-        } else {
-          const expText = sub.expiresAt
-            ? `${sub.expiresAt.toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })}`
-            : 'Lifetime';
-          const sisaHari = sub.expiresAt
-            ? Math.ceil((sub.expiresAt - new Date()) / 86400000)
-            : null;
-          await sendTG(chatId,
-            `\u2705 <b>Status Langganan</b>\n\n` +
-            `Nama: ${sub.firstName || senderName}\n` +
-            `Status: <b>Aktif</b>\n` +
-            `Berlangganan sejak: ${sub.subscribedAt.toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })}\n` +
-            `Masa berlaku: ${expText}` +
-            (sisaHari !== null ? ` (${sisaHari} hari lagi)` : '') + '\n\n' +
-            'Gunakan /dashboard untuk membuka trade analyzer.'
-          );
-        }
-      }
-      return res.sendStatus(200);
-    }
-
-    // --- Admin commands (only ADMIN_ID) ---
-    if (ADMIN_ID && senderId !== ADMIN_ID) {
-      res.sendStatus(200);
-      return;
-    }
-
-    // /adduser <telegram_id> [hari] — tambah pelanggan
-    if (text.startsWith('/adduser ')) {
-      const parts = text.split(' ');
-      const targetId = Number(parts[1]);
-      const days = Number(parts[2]) || 30;
-      if (!targetId) { await sendTG(chatId, 'Format: /adduser <telegram_id> [hari]\nContoh: /adduser 123456789 30'); return res.sendStatus(200); }
-      await addSubscriber(targetId, '', '', days);
-      await sendTG(chatId, `\u2705 Pelanggan <code>${targetId}</code> ditambahkan (${days} hari).`);
-      return res.sendStatus(200);
-    }
-
-    // /removeuser <telegram_id> — hapus pelanggan
-    if (text.startsWith('/removeuser ')) {
-      const targetId = Number(text.split(' ')[1]);
-      if (!targetId) { await sendTG(chatId, 'Format: /removeuser <telegram_id>'); return res.sendStatus(200); }
-      await removeSubscriber(targetId);
-      await sendTG(chatId, `\u274C Pelanggan <code>${targetId}</code> dihapus.`);
-      return res.sendStatus(200);
-    }
-
     res.sendStatus(200);
   } catch (err) {
     console.error('[Telegram Webhook] Error:', err.message);
@@ -555,8 +432,8 @@ app.post('/api/telegram-webhook', async (req, res) => {
   }
 });
 
-// Web App auth endpoint (checks subscription)
-app.post('/api/auth-tg', async (req, res) => {
+// Web App auth endpoint
+app.post('/api/auth-tg', (req, res) => {
   const { initData } = req.body;
   if (!initData || !verifyTelegramInitData(initData)) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -564,18 +441,9 @@ app.post('/api/auth-tg', async (req, res) => {
   const params = new URLSearchParams(initData);
   let user = {};
   try { user = JSON.parse(params.get('user') || '{}'); } catch {}
-
-  // Check subscription (skip if no BOT_TOKEN = dev mode)
-  if (BOT_TOKEN) {
-    const subscribed = await isSubscriber(user.id);
-    if (!subscribed) {
-      return res.json({ success: false, subscribed: false, message: 'Anda belum berlangganan.' });
-    }
-  }
-
   const token = crypto.randomBytes(32).toString('hex');
   activeSessions.set(token, { userId: user.id, username: user.username, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
-  res.json({ success: true, subscribed: true, token, user });
+  res.json({ success: true, token, user });
 });
 
 // Register webhook with Telegram on startup
@@ -599,21 +467,10 @@ async function registerTelegramWebhook() {
 }
 
 // --------------------------------------------------------------------
-//  API Routing (protected by session auth when BOT_TOKEN is set)
+//  API Routing
 // --------------------------------------------------------------------
 
-// Auth middleware for data API routes
-function requireAuth(req, res, next) {
-  if (!BOT_TOKEN) return next(); // Dev mode: skip auth
-  if (validateSession(req)) return next();
-  res.status(403).json({ error: 'Akses ditolak. Buka dashboard melalui Telegram.' });
-}
-
-// Routes that are always public
-// (webhook, auth, test-telegram, proxy routes — no protection needed)
-
-// Protected data routes
-app.get('/api/terminal-state', requireAuth, (req, res) => {
+app.get('/api/terminal-state', (req, res) => {
   res.json({
     activeTrades: tradeManager.activeTrades,
     tradeHistory: tradeManager.tradeHistory,
@@ -628,7 +485,7 @@ app.get('/api/terminal-state', requireAuth, (req, res) => {
 
 // Cached market data: browsers read candles + live price from the server's own
 // poller cache instead of each hitting Yahoo. Reads in-memory state, no upstream call.
-app.get('/api/market-data', requireAuth, (req, res) => {
+app.get('/api/market-data', (req, res) => {
   const symbol = req.query.symbol;
   const rawCandles = (symbol && historyMap[symbol]) ? historyMap[symbol].slice(-500) : [];
   // Re-apply the forex outlier-wick filter on read, so candles cached in memory
