@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
+import crypto from 'crypto';
 
 // Load environment variables
 dotenv.config();
@@ -69,6 +70,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 7860;
 const TIMEFRAME = process.env.AUTOPILOT_TIMEFRAME || '15m';
 const SYMBOLS = ['BTCUSDT', 'XAUUSD', 'GBPUSD', 'USDCAD'];
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const WEBAPP_URL = process.env.TELEGRAM_WEBAPP_URL || '';
+
+// Active sessions for Web App auth (userId -> { token, expires })
+const activeSessions = new Map();
 
 // Filter active autopilot symbols to maximize returns and eliminate noise
 const AUTOPILOT_SYMBOLS = ['BTCUSDT', 'XAUUSD', 'GBPUSD', 'USDCAD'];
@@ -96,6 +102,36 @@ const lastScannedCandleTime = {};
 
 // Helper delay utility
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// --------------------------------------------------------------------
+//  Telegram Web App Auth (initData verification)
+// --------------------------------------------------------------------
+function verifyTelegramInitData(initData) {
+  if (!initData || !BOT_TOKEN) return false;
+  try {
+    const params = new URLSearchParams(initData);
+    const hash = params.get('hash');
+    if (!hash) return false;
+    params.delete('hash');
+    const dataCheckString = [...params.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${k}=${v}`)
+      .join('\n');
+    const secretKey = crypto.createHash('sha256').update(BOT_TOKEN).digest();
+    const hmac = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+    return hmac === hash;
+  } catch { return false; }
+}
+
+function validateSession(req) {
+  const auth = req.headers['authorization'];
+  if (!auth || !auth.startsWith('Bearer ')) return false;
+  const token = auth.slice(7);
+  const session = activeSessions.get(token);
+  if (!session) return false;
+  if (Date.now() > session.expiresAt) { activeSessions.delete(token); return false; }
+  return true;
+}
 
 // --------------------------------------------------------------------
 //  Background 24/7 Scanning and Feed Handlers
@@ -347,6 +383,87 @@ async function startAutopilot() {
 
   // Monitor feed liveness; alert (weekend-aware) if a feed stalls during market hours.
   setInterval(checkFeedHealth, 5 * 60 * 1000);
+}
+
+// --------------------------------------------------------------------
+//  Telegram Bot Webhook & Commands
+// --------------------------------------------------------------------
+app.post('/api/telegram-webhook', async (req, res) => {
+  try {
+    const update = req.body;
+    if (!update.message || !update.message.text) return res.sendStatus(200);
+
+    const chatId = update.message.chat.id;
+    const text = update.message.text.trim();
+
+    if (text === '/start' || text === '/dashboard') {
+      const webAppUrl = WEBAPP_URL || `${process.env.RENDER_EXTERNAL_URL || ''}`;
+      if (!webAppUrl) {
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: 'WEBAPP_URL belum dikonfigurasi di environment variable.',
+          }),
+        });
+        return res.sendStatus(200);
+      }
+      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: '\u{1F4CA} <b>Trade Analyzer Dashboard</b>\n\nKlik tombol di bawah untuk membuka dashboard analisa trading.',
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [[{
+              text: '\u{1F680} Buka Dashboard',
+              web_app: { url: webAppUrl },
+            }]],
+          },
+        }),
+      });
+    }
+    res.sendStatus(200);
+  } catch (err) {
+    console.error('[Telegram Webhook] Error:', err.message);
+    res.sendStatus(500);
+  }
+});
+
+// Web App auth endpoint
+app.post('/api/auth-tg', (req, res) => {
+  const { initData } = req.body;
+  if (!initData || !verifyTelegramInitData(initData)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const params = new URLSearchParams(initData);
+  let user = {};
+  try { user = JSON.parse(params.get('user') || '{}'); } catch {}
+  const token = crypto.randomBytes(32).toString('hex');
+  activeSessions.set(token, { userId: user.id, username: user.username, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
+  res.json({ success: true, token, user });
+});
+
+// Register webhook with Telegram on startup
+async function registerTelegramWebhook() {
+  if (!BOT_TOKEN) { console.log('[Telegram] No BOT_TOKEN, skipping webhook registration.'); return; }
+  const baseUrl = process.env.RENDER_EXTERNAL_URL;
+  if (!baseUrl) { console.log('[Telegram] No RENDER_EXTERNAL_URL, skipping webhook.'); return; }
+  const webhookUrl = `${baseUrl}/api/telegram-webhook`;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: webhookUrl }),
+    });
+    const data = await r.json();
+    if (data.ok) console.log(`[Telegram] Webhook registered: ${webhookUrl}`);
+    else console.error('[Telegram] Webhook registration failed:', data.description);
+  } catch (err) {
+    console.error('[Telegram] Webhook registration error:', err.message);
+  }
 }
 
 // --------------------------------------------------------------------
@@ -644,17 +761,20 @@ async function bootServer() {
     console.log('[Server] MongoDB terminal state recovered successfully.');
     console.log(`[Server] Active Positions: ${tradeManager.activeTrades.length} | Balance: $${tradeManager.accountBalance.toFixed(2)}`);
 
-    // 2. Start 24/7 scanning feed loops
+    // 2. Register Telegram webhook for /start and /dashboard commands
+    await registerTelegramWebhook();
+
+    // 3. Start 24/7 scanning feed loops
     await startAutopilot();
 
-    // 3. Start scheduled Telegram reports every 15 minutes
+    // 4. Start scheduled Telegram reports every 15 minutes
     setTimeout(() => {
       sendScheduledReport();
       setInterval(sendScheduledReport, 15 * 60 * 1000);
       console.log('[Server] Telegram scheduled reports active (every 15 minutes).');
     }, 60 * 1000);
 
-    // 4. Bind HTTP Port listener
+    // 5. Bind HTTP Port listener
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[Server] Trade Analyzer Full-Stack Engine running on port ${PORT}`);
     });
