@@ -75,6 +75,13 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const WEBAPP_URL = process.env.TELEGRAM_WEBAPP_URL || '';
 const ADMIN_ID = process.env.ADMIN_TELEGRAM_ID ? Number(process.env.ADMIN_TELEGRAM_ID) : null;
 
+// Subscription pricing (Telegram Stars)
+const SUB_PLANS = [
+  { label: '1 Minggu', days: 7, stars: 50 },
+  { label: '1 Bulan', days: 30, stars: 150 },
+  { label: '3 Bulan', days: 90, stars: 350 },
+];
+
 // Active sessions for Web App auth (token -> { userId, username, expiresAt })
 const activeSessions = new Map();
 
