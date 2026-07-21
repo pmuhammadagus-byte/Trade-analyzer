@@ -388,43 +388,134 @@ async function startAutopilot() {
 // --------------------------------------------------------------------
 //  Telegram Bot Webhook & Commands
 // --------------------------------------------------------------------
+const ADMIN_ID = process.env.ADMIN_TELEGRAM_ID ? Number(process.env.ADMIN_TELEGRAM_ID) : null;
+
 app.post('/api/telegram-webhook', async (req, res) => {
   try {
     const update = req.body;
     if (!update.message || !update.message.text) return res.sendStatus(200);
 
     const chatId = update.message.chat.id;
+    const senderId = update.message.from?.id;
+    const senderName = update.message.from?.first_name || '';
+    const senderUsername = update.message.from?.username || '';
     const text = update.message.text.trim();
 
-    if (text === '/start' || text === '/dashboard') {
-      const webAppUrl = WEBAPP_URL || `${process.env.RENDER_EXTERNAL_URL || ''}`;
-      if (!webAppUrl) {
-        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: 'WEBAPP_URL belum dikonfigurasi di environment variable.',
-          }),
-        });
-        return res.sendStatus(200);
-      }
+    // Helper to send Telegram message
+    async function sendTG(chatId, text, replyMarkup) {
       await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: '\u{1F4CA} <b>Trade Analyzer Dashboard</b>\n\nKlik tombol di bawah untuk membuka dashboard analisa trading.',
-          parse_mode: 'HTML',
-          reply_markup: {
-            inline_keyboard: [[{
-              text: '\u{1F680} Buka Dashboard',
-              web_app: { url: webAppUrl },
-            }]],
-          },
-        }),
+        body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', ...(replyMarkup ? { reply_markup: replyMarkup } : {}) }),
       });
     }
+
+    const isAdmin = ADMIN_ID && senderId === ADMIN_ID;
+
+    // --- /start — welcome + buka dashboard jika subscriber ---
+    if (text === '/start') {
+      const webAppUrl = WEBAPP_URL || `${process.env.RENDER_EXTERNAL_URL || ''}`;
+      if (!webAppUrl) { await sendTG(chatId, 'WEBAPP_URL belum dikonfigurasi.'); return res.sendStatus(200); }
+
+      const hasAccess = await dbManager.isSubscriber(senderId);
+      if (hasAccess) {
+        await sendTG(chatId,
+          '\u{1F4CA} <b>Trade Analyzer</b>\n\nSelamat datang! Klik tombol untuk membuka dashboard.',
+          { inline_keyboard: [[{ text: '\u{1F680} Buka Dashboard', web_app: { url: webAppUrl } }]] }
+        );
+      } else {
+        await sendTG(chatId,
+          '\u{1F514} <b>Trade Analyzer</b>\n\nAnda belum memiliki akses.\n\n' +
+          'Beli akses lifetime di lynk.id, lalu gunakan:\n<code>/redeem KODE_ANDA</code>\n\n' +
+          'Contoh: <code>/redeem A1B2C3D4</code>'
+        );
+      }
+      return res.sendStatus(200);
+    }
+
+    // --- /dashboard — buka dashboard (hanya subscriber) ---
+    if (text === '/dashboard') {
+      const webAppUrl = WEBAPP_URL || `${process.env.RENDER_EXTERNAL_URL || ''}`;
+      if (!webAppUrl) { await sendTG(chatId, 'WEBAPP_URL belum dikonfigurasi.'); return res.sendStatus(200); }
+
+      const hasAccess = await dbManager.isSubscriber(senderId);
+      if (hasAccess) {
+        await sendTG(chatId,
+          '\u{1F680} <b>Dashboard</b>',
+          { inline_keyboard: [[{ text: '\u{1F4CA} Buka Dashboard', web_app: { url: webAppUrl } }]] }
+        );
+      } else {
+        await sendTG(chatId, 'Anda belum memiliki akses. Gunakan /redeem <code>KODE</code> untuk mengaktifkan.');
+      }
+      return res.sendStatus(200);
+    }
+
+    // --- /redeem <KODE> — tukar kode invite (semua user) ---
+    if (text.startsWith('/redeem ')) {
+      const code = text.split(' ')[1]?.trim();
+      if (!code) { await sendTG(chatId, 'Format: /redeem <KODE>\nContoh: /redeem A1B2C3D4'); return res.sendStatus(200); }
+      const result = await dbManager.redeemCode(code, senderId, senderUsername, senderName);
+      await sendTG(chatId, result.ok
+        ? `\u2705 ${result.message}\n\nGunakan /dashboard untuk membuka dashboard.`
+        : `\u274C ${result.message}`
+      );
+      return res.sendStatus(200);
+    }
+
+    // --- /subs — cek status akses (semua user) ---
+    if (text === '/subs') {
+      if (isAdmin) {
+        const subs = await dbManager.listSubscribers();
+        if (subs.length === 0) { await sendTG(chatId, 'Belum ada pelanggan.'); return res.sendStatus(200); }
+        let list = `\u{1F4CB} <b>Pelanggan (${subs.length})</b>\n\n`;
+        for (const s of subs) {
+          list += `<code>${s.telegramUserId}</code> @${s.username || '-'} ${s.firstName}\n`;
+        }
+        await sendTG(chatId, list);
+      } else {
+        const hasAccess = await dbManager.isSubscriber(senderId);
+        await sendTG(chatId, hasAccess
+          ? '\u2705 <b>Status: Aktif (Lifetime)</b>\n\nGunakan /dashboard untuk membuka dashboard.'
+          : '\u{1F514} <b>Status: Belum memiliki akses</b>\n\nGunakan /redeem <code>KODE</code> untuk mengaktifkan.'
+        );
+      }
+      return res.sendStatus(200);
+    }
+
+    // --- /myid — cek ID sendiri (semua user) ---
+    if (text === '/myid') {
+      await sendTG(chatId, `ID Anda: <code>${senderId}</code>`);
+      return res.sendStatus(200);
+    }
+
+    // --- Admin commands ---
+    if (!isAdmin) return res.sendStatus(200);
+
+    // /gen [jumlah] — generate kode invite
+    if (text.startsWith('/gen')) {
+      const count = Number(text.split(' ')[1]) || 1;
+      const codes = await dbManager.generateInviteCodes(count);
+      if (codes.length === 0) { await sendTG(chatId, 'Gagal generate kode.'); return res.sendStatus(200); }
+      let msg = `\u{1F4CB} <b>${codes.length} Kode Invite</b>\n\n`;
+      for (const c of codes) msg += `<code>${c.code}</code>\n`;
+      msg += '\nKirim kode ini ke pembeli.';
+      await sendTG(chatId, msg);
+      return res.sendStatus(200);
+    }
+
+    // /codes — lihat semua kode (digunakan & belum)
+    if (text === '/codes') {
+      const codes = await dbManager.listInviteCodes();
+      if (codes.length === 0) { await sendTG(chatId, 'Belum ada kode.'); return res.sendStatus(200); }
+      let msg = `\u{1F4CB} <b>Semua Kode (${codes.length})</b>\n\n`;
+      for (const c of codes) {
+        const status = c.usedBy ? `\u2705 dipakai oleh <code>${c.usedBy}</code>` : '\u{1F514} belum dipakai';
+        msg += `<code>${c.code}</code> — ${status}\n`;
+      }
+      await sendTG(chatId, msg);
+      return res.sendStatus(200);
+    }
+
     res.sendStatus(200);
   } catch (err) {
     console.error('[Telegram Webhook] Error:', err.message);
@@ -432,8 +523,8 @@ app.post('/api/telegram-webhook', async (req, res) => {
   }
 });
 
-// Web App auth endpoint
-app.post('/api/auth-tg', (req, res) => {
+// Web App auth endpoint (checks subscription)
+app.post('/api/auth-tg', async (req, res) => {
   const { initData } = req.body;
   if (!initData || !verifyTelegramInitData(initData)) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -441,9 +532,18 @@ app.post('/api/auth-tg', (req, res) => {
   const params = new URLSearchParams(initData);
   let user = {};
   try { user = JSON.parse(params.get('user') || '{}'); } catch {}
+
+  // Check subscription
+  if (BOT_TOKEN) {
+    const hasAccess = await dbManager.isSubscriber(user.id);
+    if (!hasAccess) {
+      return res.json({ success: false, subscribed: false, message: 'Anda belum memiliki akses.' });
+    }
+  }
+
   const token = crypto.randomBytes(32).toString('hex');
   activeSessions.set(token, { userId: user.id, username: user.username, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
-  res.json({ success: true, token, user });
+  res.json({ success: true, subscribed: true, token, user });
 });
 
 // Register webhook with Telegram on startup

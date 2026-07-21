@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import crypto from 'crypto';
 
 const stateSchema = new mongoose.Schema({
   stateId: { type: String, default: 'global_state', unique: true },
@@ -12,6 +13,26 @@ const stateSchema = new mongoose.Schema({
 }, { minimize: false });
 
 const StateModel = mongoose.model('TerminalState', stateSchema);
+
+const inviteCodeSchema = new mongoose.Schema({
+  code: { type: String, required: true, unique: true },
+  usedBy: { type: Number, default: null },
+  username: { type: String, default: '' },
+  firstName: { type: String, default: '' },
+  usedAt: { type: Date, default: null },
+  createdAt: { type: Date, default: Date.now },
+});
+const InviteCode = mongoose.model('InviteCode', inviteCodeSchema);
+
+const subscriberSchema = new mongoose.Schema({
+  telegramUserId: { type: Number, required: true, unique: true },
+  username: { type: String, default: '' },
+  firstName: { type: String, default: '' },
+  active: { type: Boolean, default: true },
+  subscribedAt: { type: Date, default: Date.now },
+  expiresAt: { type: Date, default: null },
+});
+const Subscriber = mongoose.model('Subscriber', subscriberSchema);
 
 export class DBManager {
   constructor() {
@@ -105,6 +126,52 @@ export class DBManager {
     } catch (err) {
       console.error('[DBManager] Error updating state fields:', fields, err);
     }
+  }
+
+  // ---- Invite Code System ----
+
+  async generateInviteCodes(count) {
+    const codes = [];
+    for (let i = 0; i < count; i++) {
+      const code = crypto.randomBytes(4).toString('hex').toUpperCase();
+      const doc = await InviteCode.findOneAndUpdate(
+        { code },
+        { code, createdAt: new Date() },
+        { upsert: true, new: true }
+      );
+      if (doc && !doc.usedBy) codes.push(doc);
+    }
+    return codes;
+  }
+
+  async redeemCode(code, telegramUserId, username, firstName) {
+    const invite = await InviteCode.findOne({ code: code.toUpperCase(), usedBy: null });
+    if (!invite) return { ok: false, message: 'Kode tidak valid atau sudah digunakan.' };
+    invite.usedBy = telegramUserId;
+    invite.usedAt = new Date();
+    invite.username = username || '';
+    invite.firstName = firstName || '';
+    await invite.save();
+    await Subscriber.findOneAndUpdate(
+      { telegramUserId },
+      { telegramUserId, username: username || '', firstName: firstName || '', active: true, subscribedAt: new Date(), expiresAt: null },
+      { upsert: true, new: true }
+    );
+    return { ok: true, message: 'Berhasil! Akses lifetime Anda sudah aktif.' };
+  }
+
+  async isSubscriber(telegramUserId) {
+    if (!telegramUserId) return false;
+    const sub = await Subscriber.findOne({ telegramUserId, active: true });
+    return !!sub;
+  }
+
+  async listInviteCodes() {
+    return InviteCode.find().sort({ createdAt: -1 });
+  }
+
+  async listSubscribers() {
+    return Subscriber.find({ active: true }).sort({ subscribedAt: -1 });
   }
 }
 
